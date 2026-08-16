@@ -6902,8 +6902,11 @@ dependencies = [
  "bot-core",
  "chrono",
  "crossterm",
+ "futures",
  "ratatui",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

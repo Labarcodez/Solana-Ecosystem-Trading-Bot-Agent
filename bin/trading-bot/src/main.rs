@@ -18,7 +18,7 @@ use config::AppConfig;
 use risk::{RiskDecision, RiskManager};
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -103,6 +103,10 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let (price_tx, _) = broadcast::channel::<bot_core::PriceTick>(4096);
     let (event_tx, _) = broadcast::channel::<AppEvent>(4096);
     let (sig_tx, sig_rx) = mpsc::unbounded_channel::<bot_core::Signal>();
+    // `watch`, not `broadcast`: the TUI only ever wants the *current*
+    // equity/PnL snapshot, never a backlog - a new subscriber shouldn't
+    // have to replay history to catch up, unlike the event log.
+    let (snapshot_tx, snapshot_rx) = watch::channel(bot_core::Snapshot::default());
 
     // --- Market data source ---
     // Real USDC mint (6 decimals) - data/sample_sol_usdc.csv is a real
@@ -177,6 +181,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let mut risk_mgr = RiskManager::new(risk_cfg, tiers, cfg.execution.slippage_bps, starting_capital_sol);
         let storage = storage.clone();
         let wallet_keypair = wallet_keypair;
+        let snapshot_tx = snapshot_tx;
 
         // In mock mode there is exactly one tradable asset; in a future
         // live wiring this comes from discovery's MintRegistry (see
@@ -232,6 +237,14 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         None => break,
                     }
                 }
+                let _ = snapshot_tx.send(bot_core::Snapshot {
+                    equity_sol: risk_mgr.equity_sol(),
+                    realized_pnl_sol: risk_mgr.realized_pnl_sol(),
+                    unrealized_pnl_sol: risk_mgr.total_unrealized_pnl_sol(),
+                    daily_pnl_sol: risk_mgr.daily_pnl_sol(),
+                    open_positions: risk_mgr.open_position_count(),
+                    circuit_breaker_tripped: risk_mgr.is_breaker_tripped(),
+                });
             }
         })
     };
@@ -257,17 +270,62 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         })
     };
 
-    // --- Wait for shutdown: Ctrl-C, or (in mock mode) the replay finishing ---
+    // --- TUI dashboard (unless --no-tui) ---
+    // Read-only subscriber over the same buses everything else uses - see
+    // tui::dashboard for why a slow redraw can't backpressure the trading
+    // loop. `q` inside the dashboard sends ControlCommand::Quit here, which
+    // drives the same shutdown path as Ctrl-C.
+    let (tui_task, mut tui_quit_rx) = if !args.no_tui {
+        let channels = tui::DashboardChannels {
+            price_rx: price_tx.subscribe(),
+            event_rx: event_tx.subscribe(),
+            snapshot_rx: snapshot_rx.clone(),
+        };
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (quit_tx, quit_rx) = mpsc::unbounded_channel::<()>();
+        let sd = shutdown.clone();
+        let mode_label = mode.clone();
+        let strategy_label = cfg.general.strategy.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = tui::run(mode_label, strategy_label, channels, control_tx, sd).await {
+                tracing::error!("tui error (is this running in a real terminal?): {e}");
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(cmd) = control_rx.recv().await {
+                if cmd == tui::ControlCommand::Quit {
+                    let _ = quit_tx.send(());
+                }
+            }
+        });
+        (Some(handle), Some(quit_rx))
+    } else {
+        (None, None)
+    };
+
+    // --- Wait for shutdown: Ctrl-C, 'q' in the dashboard, or (in mock
+    // mode) the replay finishing ---
+    let quit_signal = async {
+        match tui_quit_rx.as_mut() {
+            Some(rx) => {
+                rx.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     match market_data_task {
         Some(handle) => {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C, shutting down"),
+                _ = quit_signal => tracing::info!("dashboard quit requested, shutting down"),
                 _ = handle => tracing::info!("price source finished, shutting down"),
             }
         }
         None => {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("received Ctrl-C, shutting down");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C, shutting down"),
+                _ = quit_signal => tracing::info!("dashboard quit requested, shutting down"),
+            }
         }
     }
 
@@ -278,6 +336,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let _ = tokio::time::timeout(Duration::from_secs(10), async {
         let _ = strategy_task.await;
         let _ = risk_execution_task.await;
+        if let Some(handle) = tui_task {
+            let _ = handle.await;
+        }
     })
     .await;
     // Now that both producers are done, dropping our own sender is what

@@ -93,6 +93,16 @@ impl RiskManager {
         self.daily_realized_pnl_sol + self.unrealized_pnl_sol()
     }
 
+    /// Realized PnL accumulated so far today (resets on UTC day rollover).
+    pub fn realized_pnl_sol(&self) -> f64 {
+        self.daily_realized_pnl_sol
+    }
+
+    /// Mark-to-market unrealized PnL across all open positions.
+    pub fn total_unrealized_pnl_sol(&self) -> f64 {
+        self.unrealized_pnl_sol()
+    }
+
     /// Total mark-to-market equity: free capital plus the current value of
     /// every open position at its last-seen price. Used for the TUI's
     /// equity display and the backtester's equity curve.

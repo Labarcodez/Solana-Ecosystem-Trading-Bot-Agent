@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `tui`: the live Ratatui dashboard. `app.rs` holds pure, unit-testable
+//! state; `ui.rs` renders it (also tested, via `ratatui::backend::TestBackend`,
+//! no real terminal needed); `dashboard.rs` is the async task that ties both
+//! to the shared broadcast/watch channels and owns the actual terminal.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod app;
+pub mod dashboard;
+pub mod error;
+pub mod ui;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use app::App;
+pub use dashboard::{run, ControlCommand, DashboardChannels};
+pub use error::TuiError;
