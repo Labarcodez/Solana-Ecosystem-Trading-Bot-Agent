@@ -119,6 +119,7 @@ impl Strategy for MomentumStrategy {
                 "SMA{} {:.6} vs SMA{} {:.6} ({:+.2}%)",
                 self.cfg.short_window, short_sma, self.cfg.long_window, long_sma, separation_pct
             ),
+            strategy: self.name().to_string(),
             ts: tick.ts,
         }]
     }

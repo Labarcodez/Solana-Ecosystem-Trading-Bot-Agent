@@ -92,6 +92,7 @@ impl Strategy for GridStrategy {
                         mint: tick.mint,
                         strength: 0.8,
                         reason: format!("grid level {k} ({lvl:.6}) crossed falling"),
+                        strategy: "grid".to_string(),
                         ts: tick.ts,
                     });
                 }
@@ -107,6 +108,7 @@ impl Strategy for GridStrategy {
                         mint: tick.mint,
                         strength: 0.8,
                         reason: format!("grid level {k} ({lvl:.6}) crossed rising"),
+                        strategy: "grid".to_string(),
                         ts: tick.ts,
                     });
                 }

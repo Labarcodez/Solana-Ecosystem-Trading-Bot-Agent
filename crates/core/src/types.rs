@@ -30,7 +30,7 @@ pub enum TokenPhase {
 /// time. This is the rule-based v1 mechanism described in the README; a
 /// learned scorer can later populate the same tier without changing how
 /// `risk` consumes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TrustTier {
     /// Pre-graduation pump.fun token: least known, tightest risk budget.
     BondingCurve,
@@ -72,6 +72,7 @@ pub struct Signal {
     /// Confidence in [0.0, 1.0], used by the risk manager to scale position size.
     pub strength: f64,
     pub reason: String,
+    pub strategy: String,
     pub ts: i64,
 }
 

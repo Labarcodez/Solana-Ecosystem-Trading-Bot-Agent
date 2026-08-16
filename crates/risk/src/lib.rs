@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `risk`: the sole veto point between a strategy's signals and the
+//! executor. Owns per-trust-tier position sizing, stop-loss/take-profit
+//! (checked every price tick, not just when a strategy fires), and the
+//! daily-loss circuit breaker.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod circuit_breaker;
+pub mod config;
+pub mod position;
+pub mod risk_manager;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use circuit_breaker::{BreakerState, CircuitBreaker};
+pub use config::{default_tiers, RiskConfig, TierConfig};
+pub use position::OpenPosition;
+pub use risk_manager::{RiskDecision, RiskManager};
