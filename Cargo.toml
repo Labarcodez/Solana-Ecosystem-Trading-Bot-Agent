@@ -49,6 +49,8 @@ tonic = { version = "0.12", features = ["tls-native-roots"] }
 # Solana
 solana-sdk = "2"
 solana-client = "2"
+solana-system-interface = "1"
+bincode = "1"
 
 # Crypto / key handling
 aes-gcm = "0.10"

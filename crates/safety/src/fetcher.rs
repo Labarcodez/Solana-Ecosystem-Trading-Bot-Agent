@@ -22,7 +22,7 @@ use crate::mint_parser::decode_mint_account;
 /// silently passing. Extending this to recognize specific locker programs
 /// is future work, not something this v1 claims to do.
 pub fn burn_address() -> Pubkey {
-    Pubkey::from_str("1nc1nerator11111111111111111111111111111").expect("valid static pubkey")
+    Pubkey::from_str("1nc1nerator11111111111111111111111111111111").expect("valid static pubkey")
 }
 
 /// Fetches everything the safety scorer needs for `token`.
@@ -79,4 +79,18 @@ pub async fn fetch_onchain_snapshot(
         liquidity_sol,
         age_secs: (now_ts - token.discovered_at).max(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: the burn address is a hand-typed constant this
+    /// module can't otherwise unit-test (everything else here needs a live
+    /// RPC connection) - this at least catches a malformed/mistyped pubkey
+    /// at test time instead of only failing silently at runtime.
+    #[test]
+    fn burn_address_parses_as_a_valid_pubkey() {
+        let _ = burn_address();
+    }
 }

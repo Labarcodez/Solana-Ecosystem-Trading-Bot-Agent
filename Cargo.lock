@@ -1525,6 +1525,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bincode",
  "bot-core",
  "bs58",
  "reqwest",
@@ -1532,6 +1533,7 @@ dependencies = [
  "serde_json",
  "solana-client",
  "solana-sdk",
+ "solana-system-interface",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
