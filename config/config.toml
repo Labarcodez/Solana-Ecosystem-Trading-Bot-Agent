@@ -79,3 +79,4 @@ data_file = "data/sample_sol_usdc.csv"
 slippage_bps = 50
 fee_bps = 30
 starting_capital_sol = 10.0
+jito_tip_lamports = 10000

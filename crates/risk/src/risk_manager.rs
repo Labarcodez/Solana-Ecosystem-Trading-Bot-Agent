@@ -93,6 +93,25 @@ impl RiskManager {
         self.daily_realized_pnl_sol + self.unrealized_pnl_sol()
     }
 
+    /// Total mark-to-market equity: free capital plus the current value of
+    /// every open position at its last-seen price. Used for the TUI's
+    /// equity display and the backtester's equity curve.
+    pub fn equity_sol(&self) -> f64 {
+        let positions_value: f64 = self
+            .open_positions
+            .values()
+            .map(|p| {
+                let price = self
+                    .last_prices
+                    .get(&p.token_meta.mint)
+                    .copied()
+                    .unwrap_or(p.entry_price);
+                p.qty * price
+            })
+            .sum();
+        self.capital_sol + positions_value
+    }
+
     /// Drain events accumulated since the last call (circuit breaker
     /// trip/reset notifications). The caller forwards these onto the shared
     /// event bus.
