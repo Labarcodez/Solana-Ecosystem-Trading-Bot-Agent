@@ -5,6 +5,7 @@
 
 mod cli;
 mod config;
+mod telegram;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -270,6 +271,30 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         })
     };
 
+    // --- Optional Telegram alerts (fills, circuit-breaker trips, errors) ---
+    // Same "drain before closing" reasoning as log_task: only stops once
+    // every event_tx sender is gone. Never starts at all unless both
+    // TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in .env.
+    let telegram_task = telegram::TelegramClient::from_env().map(|client| {
+        let mut event_rx = event_tx.subscribe();
+        tracing::info!("Telegram alerts enabled");
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(event) => {
+                        if let Some(text) = telegram::format_event(&event) {
+                            if let Err(e) = client.send_message(&text).await {
+                                tracing::warn!("failed to send Telegram alert: {e}");
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    });
+
     // --- TUI dashboard (unless --no-tui) ---
     // Read-only subscriber over the same buses everything else uses - see
     // tui::dashboard for why a slow redraw can't backpressure the trading
@@ -346,6 +371,9 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // drained every event sent above before its `recv()` returns `Closed`.
     drop(event_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), log_task).await;
+    if let Some(handle) = telegram_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
     storage.shutdown();
 
     tracing::info!("shutdown complete");

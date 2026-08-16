@@ -33,3 +33,6 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 solana-sdk.workspace = true
 solana-client.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
