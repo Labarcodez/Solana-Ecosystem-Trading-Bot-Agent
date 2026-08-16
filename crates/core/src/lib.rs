@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `bot-core`: domain types and the `Strategy` trait shared by every crate in
+//! the workspace. No async runtime, no network clients - kept that way
+//! deliberately so `strategies`, `risk`, and `backtester` are trivially
+//! unit-testable and so `bin/trading-bot` and `bin/backtest` can build
+//! strategies through the exact same factory function.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod strategy;
+pub mod types;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::CoreError;
+pub use strategy::Strategy;
+pub use types::*;
