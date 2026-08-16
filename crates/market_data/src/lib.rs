@@ -1,14 +1,12 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! `market_data`: real-time price streaming via Shyft's Yellowstone gRPC
+//! feed (`yellowstone.rs`), decoding generic AMM vault balances into prices
+//! (`pool_price.rs`), plus a CSV replay source (`mock.rs`) that powers
+//! `--price-source mock` for a zero-cost, zero-API-key end-to-end run.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod error;
+pub mod mock;
+pub mod pool_price;
+pub mod yellowstone;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use error::MarketDataError;
+pub use yellowstone::{stream_prices, WatchedPool, YellowstoneConfig};
