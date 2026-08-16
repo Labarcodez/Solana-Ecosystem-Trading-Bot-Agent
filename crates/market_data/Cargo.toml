@@ -1,0 +1,21 @@
+[package]
+name = "market-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "market_data"
+path = "src/lib.rs"
+
+[dependencies]
+bot-core = { path = "../core" }
+tokio.workspace = true
+futures.workspace = true
+solana-sdk.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+csv.workspace = true
+chrono.workspace = true

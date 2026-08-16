@@ -1,0 +1,20 @@
+[package]
+name = "discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "discovery"
+path = "src/lib.rs"
+
+[dependencies]
+bot-core = { path = "../core" }
+tokio.workspace = true
+futures.workspace = true
+solana-sdk.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true

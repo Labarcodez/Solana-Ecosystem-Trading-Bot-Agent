@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/strategies",
+    "crates/risk",
+    "crates/wallet",
+    "crates/market_data",
+    "crates/discovery",
+    "crates/safety",
+    "crates/execution",
+    "crates/storage",
+    "crates/tui",
+    "crates/backtester",
+    "bin/trading-bot",
+    "bin/backtest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+bs58 = "0.5"
+
+# Errors / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP / gRPC
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tonic = { version = "0.12", features = ["tls-native-roots"] }
+
+# Solana
+solana-sdk = "2"
+solana-client = "2"
+
+# Crypto / key handling
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+rpassword = "7"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.8"
+sha2 = "0.10"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# CLI / config
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+
+# Time / misc
+chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0

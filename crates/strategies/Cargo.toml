@@ -1,0 +1,15 @@
+[package]
+name = "strategies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "strategies"
+path = "src/lib.rs"
+
+[dependencies]
+bot-core = { path = "../core" }
+serde.workspace = true
+thiserror.workspace = true

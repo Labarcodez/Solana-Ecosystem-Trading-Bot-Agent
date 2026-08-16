@@ -1,0 +1,81 @@
+# Default runtime configuration. This file has NO secrets in it - those live in
+# .env (see .env.example). Everything here is a trading/risk parameter you are
+# meant to tune.
+
+[general]
+# "dry_run": full pipeline runs, real quotes are fetched, but no swap/bundle/
+#            buy-sell is ever submitted on-chain. Recommended default.
+# "live":    real trades are submitted. Requires WALLET_KEY_PATH to be unlocked.
+mode = "dry_run"
+strategy = "momentum"          # "momentum" | "grid"
+base_currency = "SOL"
+
+[strategy.momentum]
+short_window = 9
+long_window = 21
+threshold_pct = 0.5            # min crossover separation to fire a signal
+cooldown_secs = 30
+
+[strategy.grid]
+base_price = 0.0                # 0.0 = use first observed tick as base
+grid_step_pct = 2.0
+grid_levels = 5
+
+[risk]
+max_open_positions = 5
+daily_loss_limit_sol = 0.5
+daily_loss_limit_pct = 10.0
+default_stop_loss_pct = 8.0
+default_take_profit_pct = 15.0
+
+# Per-trust-tier overrides. A token's TrustTier (assigned by the `safety` and
+# `discovery` crates) selects which row applies - the bot is automatically
+# more conservative with tokens it knows less about. See README for the
+# rule-based v1 mechanism and why full ML scoring is future work, not this
+# build.
+[risk.tiers.bonding_curve]
+max_position_sol = 0.05
+risk_pct_of_capital = 1.0
+mandatory_stop_loss_pct = 15.0
+allow_take_profit_override = false
+
+[risk.tiers.migrated_new]
+max_position_sol = 0.15
+risk_pct_of_capital = 2.0
+mandatory_stop_loss_pct = 12.0
+allow_take_profit_override = true
+
+[risk.tiers.established]
+max_position_sol = 0.5
+risk_pct_of_capital = 5.0
+mandatory_stop_loss_pct = 0.0   # 0 = use default_stop_loss_pct above
+allow_take_profit_override = true
+
+[discovery]
+enabled = true
+watch_pumpfun_bonding_curve = true
+watch_pumpswap = true
+watch_raydium = true
+watch_orca = false
+
+[safety]
+# Hard checks: failing any of these rejects the token outright.
+require_mint_authority_revoked = true
+require_freeze_authority_revoked = true
+require_lp_burned_or_locked = true
+
+# Soft checks: combine into a token's trust-tier hint rather than a hard reject.
+min_liquidity_sol = 5.0
+max_holder_concentration_pct = 40.0
+min_pool_age_secs = 60
+
+[execution]
+slippage_bps = 100              # 1%
+priority_fee_lamports = 20000
+jito_tip_lamports = 10000
+
+[backtest]
+data_file = "data/sample_sol_usdc.csv"
+slippage_bps = 50
+fee_bps = 30
+starting_capital_sol = 10.0

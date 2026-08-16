@@ -1,0 +1,20 @@
+[package]
+name = "safety"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "safety"
+path = "src/lib.rs"
+
+[dependencies]
+bot-core = { path = "../core" }
+tokio.workspace = true
+async-trait.workspace = true
+solana-client.workspace = true
+solana-sdk.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
