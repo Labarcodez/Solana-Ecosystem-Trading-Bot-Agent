@@ -6876,6 +6876,8 @@ dependencies = [
  "risk",
  "safety",
  "serde",
+ "solana-client",
+ "solana-sdk",
  "storage",
  "strategies",
  "tokio",
