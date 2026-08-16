@@ -41,7 +41,7 @@ pub enum TrustTier {
 }
 
 /// Everything the pipeline knows about a token at a point in time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenMeta {
     pub mint: Pubkey,
     pub phase: TokenPhase,

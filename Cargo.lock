@@ -1365,12 +1365,16 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bot-core",
+ "chrono",
  "futures",
  "serde",
  "solana-sdk",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
+ "yellowstone-grpc-client",
+ "yellowstone-grpc-proto",
 ]
 
 [[package]]
