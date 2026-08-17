@@ -19,4 +19,7 @@ pub enum MarketDataError {
 
     #[error("vault balance is zero, cannot compute price")]
     ZeroVaultBalance,
+
+    #[error("account data does not match the expected discriminator/type")]
+    WrongAccountType,
 }
