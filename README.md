@@ -30,10 +30,15 @@ capital being spent, not a service fee.
 ## Status: what actually works right now
 
 Every crate below compiles, is unit-tested, and passes clippy with zero
-warnings. **121 tests, all passing.** The full pipeline has been run
+warnings. **152 tests, all passing.** The full pipeline has been run
 end-to-end in `--mode dry_run --price-source mock`, including a real
 momentum-strategy buy-then-sell round trip against **live** Jupiter `/quote`
 calls (no fake data, no mocked HTTP responses at the integration level).
+`--price-source live` genuinely discovers new pump.fun tokens, safety-scores
+them, and trades whatever passes — see [Honesty
+notes](#honesty-notes--known-limitations) for exactly what's verified end-to-
+end versus what's real-but-unexercised (this sandbox never had a funded RPC
+key or real SOL to run it against).
 
 Read [Honesty notes](#honesty-notes--known-limitations) before you point
 this at real funds — it explains precisely what's fully wired for live
@@ -42,14 +47,20 @@ trading today versus what's real-but-not-yet-connected.
 ## Architecture
 
 ```
-discovery ──TokenDiscovered──▶ safety (scores/filters) ──▶ market_data
-  (pump.fun create/graduate)                                (adds mint to watched set only if it passes)
+discovery::pumpfun_watcher (Yellowstone) ──WatcherEvent──▶ live_pipeline coordinator
+  (create / curve price update / graduation)      (bin/trading-bot)  │
+                                                                      ├─▶ safety::RuleBasedScorer, per new token
+                                                                      │     passed → TradableTokens map + TokenDiscovered
+                                                                      │     failed → TokenRejectedBySafety
+                                                                      └─▶ PriceTick (broadcast) — only forwarded for
+                                                                          mints already in TradableTokens
 
-market_data ──PriceTick (broadcast)──┬─▶ strategy_engine
-                                      ├─▶ risk_manager (SL/TP fires every tick, not signal-gated)
-                                      ├─▶ tui
-                                      └─▶ storage
-strategy_engine ──Signal (mpsc)──▶ risk_manager (single veto point before execution)
+PriceTick (broadcast) ──┬─▶ strategy_engine
+                         ├─▶ risk_manager (SL/TP fires every tick, not signal-gated)
+                         ├─▶ tui
+                         └─▶ storage
+strategy_engine ──Signal (mpsc)──▶ risk_manager (single veto point before execution;
+                                                   looks up the signal's mint in TradableTokens)
 risk_manager    ──ApprovedOrder──▶ executor (routes by TokenMeta.phase:
                                               bonding_curve → pump.fun client
                                               migrated       → Jupiter + Jito)
@@ -60,9 +71,15 @@ executor        ──AppEvent (broadcast)──┬─▶ storage
 ```
 
 A newly-seen mint only ever becomes tradable after `safety` clears it —
-nothing downstream can bypass that gate. `risk` is the single point between
-a strategy's signal and the executor: no code path reaches `execution`
-without going through it first.
+nothing downstream can bypass that gate: the coordinator only forwards
+price ticks (and therefore only gives `strategy_engine` anything to react
+to) for mints already in `TradableTokens`. `risk` is the single point
+between a strategy's signal and the executor: no code path reaches
+`execution` without going through it first. In `--price-source mock`, the
+same `TradableTokens` map is seeded with one hardcoded asset instead of
+being populated by discovery — everything downstream is identical either
+way. `--mode dry_run` (the default) prevents any of this from ever signing
+or submitting a real transaction, regardless of price source.
 
 ### Workspace layout
 
@@ -72,14 +89,14 @@ without going through it first.
 | `crates/strategies` | `MomentumStrategy` (SMA crossover) and `GridStrategy`, plus the `build_strategy()` factory both binaries use — this is what guarantees live and backtest runs execute identical strategy logic. |
 | `crates/risk` | `RiskManager`: per-trust-tier position sizing, stop-loss/take-profit, the daily-loss circuit breaker. |
 | `crates/wallet` | Argon2id + AES-256-GCM encrypted keypair, interactive passphrase prompts. |
-| `crates/market_data` | Real Yellowstone gRPC price streaming (vault-ratio pricing, works across any constant-product AMM) + a CSV mock-replay source. |
-| `crates/discovery` | Real-time pump.fun `create`/graduation watcher via Yellowstone gRPC. |
+| `crates/market_data` | Real Yellowstone gRPC price streaming (generic vault-ratio pricing, works across any constant-product AMM) + a PumpSwap `Pool`-account decoder + a CSV mock-replay source. |
+| `crates/discovery` | Real-time pump.fun `create`/graduation watcher via Yellowstone gRPC — also emits a live price tick on every bonding-curve balance change, not just at graduation. |
 | `crates/safety` | `TokenSafetyScorer` trait + `RuleBasedScorer` (mint/freeze authority, LP burn, holder concentration, liquidity, age). |
-| `crates/execution` | Jupiter (quote/swap), Jito (bundle landing), and a direct pump.fun bonding-curve client, routed by token phase. |
+| `crates/execution` | Jupiter (quote/swap), Jito (bundle landing), and a direct pump.fun bonding-curve client (IDL- and live-transaction-verified), routed by token phase. |
 | `crates/storage` | SQLite trade/position/equity/event log, on its own dedicated thread. |
 | `crates/tui` | The Ratatui dashboard. |
 | `crates/backtester` | Replays historical data through the *same* `Strategy`/`RiskManager` code the live bot uses. |
-| `bin/trading-bot` | The live binary — wires everything above together. |
+| `bin/trading-bot` | The live binary — wires everything above together, including `live_pipeline.rs`'s discovery → safety → dynamic watchlist → execution glue for `--price-source live`. |
 | `bin/backtest` | Thin CLI around `crates/backtester`. |
 
 ## Quick start
@@ -137,7 +154,7 @@ ones with an established track record.
 ## Testing / verification
 
 ```bash
-cargo test --workspace          # 121 tests, every crate
+cargo test --workspace          # 152 tests, every crate
 cargo clippy --workspace --all-targets   # zero warnings
 cargo run --bin backtest -- --config config/config.toml --json
 cargo run --bin trading-bot -- run --price-source mock --no-tui
@@ -164,8 +181,15 @@ scope decision made during a single build session — not a bug report.
   against the real `yellowstone-grpc-client`/`-proto` crates, decode logic
   unit-tested against constructed real-shaped fixtures. Live streaming
   needs your own free Shyft `x-token`.
-- **Solana RPC calls** (`safety::fetcher`) — real `get_account`/
-  `get_token_largest_accounts` calls against whatever RPC you configure.
+- **Solana RPC calls** (`safety::fetcher`, `live_pipeline`, `execution`) —
+  real `get_account`/`get_token_largest_accounts`/`get_latest_blockhash`
+  calls against whatever RPC you configure, for safety scoring, resolving
+  a discovered token's owning SPL program, fetching pump.fun's
+  `fee_recipient`, and building live transactions.
+- **pump.fun bonding-curve program** (`execution::pumpfun`) — account list
+  and PDA derivations verified against the official Anchor IDL *and* two
+  real mainnet `buy`/`sell` transactions (see the dedicated section below
+  for exactly what was and wasn't cross-checked).
 
 ### The rule-based safety scorer is v1, not ML
 You asked for the bot to eventually "learn and trade." A genuine ML
@@ -176,43 +200,78 @@ liquidity, age) and sits behind the `TokenSafetyScorer` trait — the exact
 seam a learned scorer would plug into later without any pipeline redesign.
 Rule-based-only for now; documented explicitly rather than overstated.
 
-### `--price-source live` is a stub, not a full live pipeline (the most
-important gap to know about)
-`discovery`, `safety`, and `market_data`'s live Yellowstone client are all
-real, independently unit-tested crates. What's **not yet wired together**
-in `bin/trading-bot` is the glue that would: spawn the discovery watcher,
-run newly-discovered tokens through the safety scorer, and dynamically add
-whatever passes to the live price-streaming watchlist. Today,
-`--price-source live` logs a warning and the bot idles waiting for Ctrl-C —
-it does not automatically discover and trade new tokens end-to-end. Wiring
-this is the natural next step and doesn't require redesigning anything
-below `bin/trading-bot/src/main.rs`; it just wasn't completed this session,
-and shipping it untested (no funded RPC key was available in this sandbox
-to verify it against) would have been worse than being upfront about the
-gap. If you extend this, `discovery::Discovery` + `safety::RuleBasedScorer`
-+ `execution::Executor`'s existing phase-based routing are the pieces to
-connect.
+### `--price-source live` is now wired end-to-end — with real, named gaps
+`bin/trading-bot/src/live_pipeline.rs` spawns `discovery::pumpfun_watcher`,
+runs every newly-created pump.fun token through `safety::RuleBasedScorer`
+against real on-chain state, and adds whatever passes to a shared,
+dynamically-growing tradable-token map that `strategy`/`risk`/`execution`
+read from exactly the way they read the single hardcoded mock-mode asset.
+A token that fails safety emits `TokenRejectedBySafety` and is never added.
+This closes what used to be the biggest gap in this document. What's still
+real-but-unexercised, and what's still genuinely missing:
+- **Never run against mainnet with real funds or a live gRPC connection.**
+  No funded RPC key or Shyft `x-token` was available in this sandbox. The
+  wiring is verified as far as it can be here: it refuses cleanly and
+  specifically (missing-env-var errors naming exactly which var) when
+  `SHYFT_GRPC_ENDPOINT`/`SHYFT_X_TOKEN`/`ALCHEMY_RPC_URL` aren't set, and
+  the full mock-mode pipeline (identical downstream code path) is verified
+  live end-to-end.
+- **A token's live price feed stops at graduation.** `TokenGraduated`
+  still updates the token's `TokenPhase`/`TrustTier` in place, and the
+  event is logged loudly (a `Warn`-level `AppEvent::Log`, not silence), but
+  PumpSwap pool discovery for the newly-migrated pool isn't wired into the
+  live price feed (see the PumpSwap section below) — so strategy signals
+  and, more importantly, **stop-loss/take-profit monitoring for any open
+  position in that token pause** until this is extended. Treat a graduation
+  during an open live position as something to watch for manually today.
+- **pump.fun's `fee_recipient` is resolved once at startup**, retried every
+  30s until it succeeds, and then never refreshed again for the rest of the
+  run. If pump.fun rotates it mid-run, live bonding-curve trades fail
+  cleanly (a specific, logged error) rather than using a stale value — but
+  they do fail until a restart.
+- **Generic (non-pump.fun) new-pool discovery isn't implemented.**
+  `discovery` watches pump.fun's `create` and graduation events — the
+  overwhelming majority of new Solana memecoin launches. A token that skips
+  pump.fun entirely and launches straight on Raydium/Orca isn't auto-
+  discovered; it can still be traded via a manually configured entry.
 
-### pump.fun bonding-curve trading needs one more verification step before `mode = "live"`
-`execution::pumpfun` has confirmed program ID, buy/sell instruction
-discriminators, and constant-product pricing math (all verified this
-session). The **full ordered account list** for the buy/sell instruction is
-assembled from public documentation and community references, not from a
-live transaction fetched in this sandbox (no funded RPC key was available
-here). **Before enabling live bonding-curve trading**, cross-check
-`PumpFunAccounts` in `crates/execution/src/pumpfun.rs` against a handful of
-recent real mainnet `buy`/`sell` transactions (`getTransaction` over your
-own RPC). Until then, live execution on a bonding-curve token is explicitly
-refused in code (`Executor::execute_bonding_curve` returns an error in live
-mode) rather than attempting an unverified instruction with real funds.
-Migrated-token trading via Jupiter has no such caveat.
+### pump.fun bonding-curve trading is IDL- and live-transaction-verified
+`execution::pumpfun`'s account list, PDA derivations, and instruction
+discriminators were rebuilt from pump.fun's official Anchor IDL and then
+cross-checked against two real, successful mainnet `buy`/`sell`
+transactions fetched over public RPC — the decoded account list matched
+the IDL account-for-account, and two of the derived global PDAs
+(`event_authority`, `global_volume_accumulator`) match the exact addresses
+observed on those real transactions (asserted in a regression test).
+`Executor::execute_bonding_curve` now genuinely builds, signs, and submits
+a live pump.fun trade rather than refusing outright. Residual, explicitly
+documented uncertainty:
+- The exact byte encoding of `buy`'s third argument (`track_volume`, an
+  Anchor `OptionBool`) follows Anchor's standard `Option<T>` convention but
+  wasn't independently decoded byte-for-byte from a real transaction's raw
+  instruction data.
+- `decode_global_fee_recipient`'s byte offset into the `Global` account is
+  taken from the IDL's field order only, not cross-checked against a live
+  account fetch (no RPC key was available in this sandbox).
+- None of this has been exercised against mainnet with real funds — it's
+  real, complete, unit-tested code that has not itself landed a live trade.
 
-### Generic (non-pump.fun) new-pool discovery isn't implemented
-`discovery` watches pump.fun's `create` and graduation events — the
-overwhelming majority of new Solana memecoin launches. A token that skips
-pump.fun entirely and launches straight on Raydium/Orca isn't auto-
-discovered. It can still be traded via the (not-yet-wired, see above) live
-watchlist or a manually configured entry.
+Migrated-token trading via Jupiter has none of these caveats — Jupiter's
+`/quote`/`/swap` endpoints are used as documented, with a live `/quote`
+call made even in dry-run.
+
+### The PumpSwap pool decoder exists but isn't wired into live price discovery
+`market_data::pumpswap_pool::decode_pool_account` decodes a PumpSwap `Pool`
+account into its two vault addresses — everything `pool_price` needs to
+watch a migrated token's live price. Its byte layout is taken from
+PumpSwap's official IDL only; unlike pump.fun's bonding-curve accounts,
+it was **not** independently cross-checked against a live transaction's raw
+bytes this session (fetching one hit Solana's multi-address-lookup-table
+resolution being ambiguous over the public RPC available here). It's also
+not yet connected to anything that discovers *which* Pool account belongs
+to a given migrated mint — that discovery step (subscribing to PumpSwap
+pool-creation, matching by `base_mint`) is what a future pass would need to
+add to close the "price feed stops at graduation" gap above.
 
 ### The backtester models fees/slippage, not order-book depth
 `SimulatedExecutor` applies a configurable slippage % + fee bps + Jito tip
