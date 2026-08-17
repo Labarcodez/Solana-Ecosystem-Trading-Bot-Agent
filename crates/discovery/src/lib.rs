@@ -19,7 +19,7 @@ pub mod error;
 pub mod pumpfun_watcher;
 pub mod registry;
 
-pub use bonding_curve::PUMPFUN_PROGRAM_ID;
+pub use bonding_curve::{PUMPFUN_PROGRAM_ID, PUMPFUN_TOKEN_DECIMALS};
 pub use error::DiscoveryError;
 pub use pumpfun_watcher::{GrpcConfig, WatcherEvent};
 pub use registry::{DiscoveryEvent, MintRegistry};
@@ -63,7 +63,7 @@ impl Discovery {
             // Only resolvable (and only emitted) for a curve whose `create`
             // we've already seen - an unresolved curve is silently dropped
             // rather than guessed at.
-            WatcherEvent::CurvePriceUpdate { curve_pda, price_sol_per_token, ts } => {
+            WatcherEvent::CurvePriceUpdate { curve_pda, price_sol_per_token, ts, .. } => {
                 let mint = self.registry.resolve_curve(&curve_pda)?;
                 Some(DiscoveryOutput::Price(bot_core::PriceTick { mint, price: price_sol_per_token, ts }))
             }
@@ -109,6 +109,9 @@ mod tests {
         let output = discovery.apply_watcher_event(WatcherEvent::CurvePriceUpdate {
             curve_pda,
             price_sol_per_token: 0.000042,
+            virtual_token_reserves: 1_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            creator: Pubkey::new_unique(),
             ts: 200,
         });
         match output {
@@ -128,6 +131,9 @@ mod tests {
         let output = discovery.apply_watcher_event(WatcherEvent::CurvePriceUpdate {
             curve_pda: unknown_curve,
             price_sol_per_token: 1.0,
+            virtual_token_reserves: 1_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            creator: Pubkey::new_unique(),
             ts: 100,
         });
         assert!(output.is_none());

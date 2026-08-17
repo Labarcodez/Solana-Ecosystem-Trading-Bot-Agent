@@ -5,6 +5,7 @@
 
 mod cli;
 mod config;
+mod live_pipeline;
 mod telegram;
 
 use std::collections::HashMap;
@@ -120,8 +121,34 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         .parse()
         .expect("valid static USDC mint");
     const SIM_MINT_DECIMALS: u8 = 6;
+    let sim_token_meta = TokenMeta {
+        mint: sim_mint,
+        phase: TokenPhase::Migrated,
+        trust_tier: TrustTier::Established,
+        discovered_at: 0,
+        source: "mock".to_string(),
+    };
+
+    // --- Dynamic tradable-token set. In mock mode this is one hardcoded
+    // entry, seeded below. In live mode it starts empty and grows as
+    // discovery::pumpfun_watcher finds new pump.fun tokens that clear
+    // safety::RuleBasedScorer - see live_pipeline.rs. Either way, strategy/
+    // risk/execution downstream read from the same map without needing to
+    // know which price source populated it. ---
+    let tradable: live_pipeline::TradableTokens = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let mut fee_recipient_cache: Option<live_pipeline::FeeRecipientCache> = None;
+
     let market_data_task = match args.price_source.as_str() {
         "mock" => {
+            tradable.write().await.insert(
+                sim_mint,
+                live_pipeline::LiveTokenState {
+                    meta: sim_token_meta.clone(),
+                    decimals: SIM_MINT_DECIMALS,
+                    curve: None,
+                    token_program: None,
+                },
+            );
             let path = args.mock_data.clone();
             let tx = price_tx.clone();
             let sd = shutdown.clone();
@@ -135,12 +162,53 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
             }))
         }
         "live" => {
-            tracing::warn!(
-                "--price-source live requires SHYFT_GRPC_ENDPOINT/SHYFT_X_TOKEN and a configured watchlist; \
-                 discovery/market_data/safety live wiring is documented in the README as needing your own \
-                 credentials and is not exercised by this run"
-            );
-            None
+            if !(cfg.discovery.enabled && cfg.discovery.watch_pumpfun_bonding_curve) {
+                tracing::warn!(
+                    "--price-source live requires [discovery].enabled and watch_pumpfun_bonding_curve = true in \
+                     the config file; discovery is disabled in this run's config, so no live tokens will ever \
+                     become tradable"
+                );
+                None
+            } else {
+                let grpc_endpoint = std::env::var("SHYFT_GRPC_ENDPOINT")
+                    .context("--price-source live requires SHYFT_GRPC_ENDPOINT in .env")?;
+                let grpc_x_token = std::env::var("SHYFT_X_TOKEN")
+                    .context("--price-source live requires SHYFT_X_TOKEN in .env")?;
+                let rpc_url = std::env::var("ALCHEMY_RPC_URL").context(
+                    "--price-source live requires ALCHEMY_RPC_URL in .env (used for safety scoring and \
+                     resolving pump.fun's fee_recipient)",
+                )?;
+                tracing::info!(
+                    "starting live pump.fun discovery: new bonding-curve tokens are safety-scored automatically \
+                     before becoming tradable"
+                );
+                tracing::warn!(
+                    "PumpSwap/Raydium pool discovery for already-migrated tokens is not wired in this build - \
+                     only pump.fun-native tokens are discovered live, and a token's price feed stops the moment \
+                     it graduates (see README)"
+                );
+
+                let handles = live_pipeline::spawn(
+                    live_pipeline::LivePipelineConfig {
+                        grpc_endpoint,
+                        grpc_x_token,
+                        rpc_url,
+                        safety_cfg: cfg.safety.clone(),
+                    },
+                    tradable.clone(),
+                    price_tx.clone(),
+                    event_tx.clone(),
+                    shutdown.clone(),
+                );
+                fee_recipient_cache = Some(handles.fee_recipient);
+                // Represented as one task for the shutdown-select below,
+                // same shape as the mock replay task.
+                Some(tokio::spawn(async move {
+                    for task in handles.tasks {
+                        let _ = task.await;
+                    }
+                }))
+            }
         }
         other => anyhow::bail!("unknown --price-source {other:?} (expected \"mock\" or \"live\")"),
     };
@@ -183,26 +251,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let storage = storage.clone();
         let wallet_keypair = wallet_keypair;
         let snapshot_tx = snapshot_tx;
-
-        // In mock mode there is exactly one tradable asset; in a future
-        // live wiring this comes from discovery's MintRegistry (see
-        // discovery::Discovery / safety::TokenSafetyScorer) instead of a
-        // single hardcoded entry.
-        let sim_token_meta = TokenMeta {
-            mint: sim_mint,
-            phase: TokenPhase::Migrated,
-            trust_tier: TrustTier::Established,
-            discovered_at: 0,
-            source: "mock".to_string(),
-        };
+        let tradable = tradable.clone();
+        let fee_recipient_cache = fee_recipient_cache.clone();
 
         tokio::spawn(async move {
             let ctx = OrderContext {
                 executor: &executor,
                 storage: &storage,
                 event_tx: &event_tx,
-                mint_decimals: SIM_MINT_DECIMALS,
                 wallet: wallet_keypair.as_ref(),
+                fee_recipient: fee_recipient_cache.as_ref(),
             };
             let mut last_price: HashMap<Pubkey, f64> = HashMap::new();
             loop {
@@ -212,7 +270,16 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         Ok(tick) => {
                             last_price.insert(tick.mint, tick.price);
                             for order in risk_mgr.on_price_tick(&tick) {
-                                handle_order(&ctx, &mut risk_mgr, order, tick.price).await;
+                                match tradable.read().await.get(&order.mint).cloned() {
+                                    Some(state) => handle_order(&ctx, &mut risk_mgr, order, tick.price, &state).await,
+                                    None => {
+                                        tracing::error!(mint = %order.mint, "no known token state for a protective-exit order; dropping");
+                                        let _ = event_tx.send(AppEvent::OrderRejected {
+                                            mint: order.mint,
+                                            reason: "no known token state".to_string(),
+                                        });
+                                    }
+                                }
                             }
                             for ev in risk_mgr.drain_events() {
                                 let _ = event_tx.send(ev);
@@ -224,14 +291,21 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     signal = sig_rx.recv() => match signal {
                         Some(signal) => {
                             let mark_price = last_price.get(&signal.mint).copied().unwrap_or(0.0);
-                            let decision = risk_mgr.evaluate_signal(&signal, &sim_token_meta, mark_price);
-                            match decision {
-                                RiskDecision::Approved(order) => {
-                                    handle_order(&ctx, &mut risk_mgr, order, mark_price).await;
+                            match tradable.read().await.get(&signal.mint).cloned() {
+                                Some(state) => {
+                                    let decision = risk_mgr.evaluate_signal(&signal, &state.meta, mark_price);
+                                    match decision {
+                                        RiskDecision::Approved(order) => {
+                                            handle_order(&ctx, &mut risk_mgr, order, mark_price, &state).await;
+                                        }
+                                        RiskDecision::Rejected(reason) => {
+                                            tracing::debug!(mint = %signal.mint, reason, "signal rejected by risk manager");
+                                            let _ = event_tx.send(AppEvent::OrderRejected { mint: signal.mint, reason });
+                                        }
+                                    }
                                 }
-                                RiskDecision::Rejected(reason) => {
-                                    tracing::debug!(mint = %signal.mint, reason, "signal rejected by risk manager");
-                                    let _ = event_tx.send(AppEvent::OrderRejected { mint: signal.mint, reason });
+                                None => {
+                                    tracing::debug!(mint = %signal.mint, "signal for a mint with no known token state; dropping");
                                 }
                             }
                         }
@@ -389,14 +463,16 @@ async fn fetch_live_balance_sol(wallet: &Keypair) -> anyhow::Result<f64> {
 
 /// Bundles the pieces `handle_order` needs beyond the order itself and the
 /// current mark price - the task-local dependencies that don't change
-/// between calls within one risk/execution task.
+/// between calls within one risk/execution task. `fee_recipient` is only
+/// `Some` in live mode (see `live_pipeline`); mock mode never trades a
+/// bonding-curve-phase token so it never needs one.
 #[derive(Clone, Copy)]
 struct OrderContext<'a> {
     executor: &'a execution::Executor,
     storage: &'a storage::StorageHandle,
     event_tx: &'a broadcast::Sender<AppEvent>,
-    mint_decimals: u8,
     wallet: Option<&'a Keypair>,
+    fee_recipient: Option<&'a live_pipeline::FeeRecipientCache>,
 }
 
 async fn handle_order(
@@ -404,9 +480,32 @@ async fn handle_order(
     risk_mgr: &mut RiskManager,
     order: bot_core::ApprovedOrder,
     mark_price: f64,
+    state: &live_pipeline::LiveTokenState,
 ) {
-    let OrderContext { executor, storage, event_tx, mint_decimals, wallet } = *ctx;
-    match executor.execute(&order, mark_price, mint_decimals, wallet, None).await {
+    let OrderContext { executor, storage, event_tx, wallet, fee_recipient } = *ctx;
+
+    // A bonding-curve order needs a fresh curve reading (cached from the
+    // last account update - see live_pipeline::CachedCurveState), the
+    // mint's owning token program, and the live fee_recipient. Any of these
+    // being unavailable means the executor cleanly refuses rather than
+    // guessing - see `execution::Executor::execute_bonding_curve`.
+    let bonding_curve_ctx = if order.token_meta.phase == TokenPhase::BondingCurve {
+        let fee_recipient = fee_recipient.and_then(|cache| *cache.lock().expect("fee_recipient cache mutex poisoned"));
+        match (state.curve, state.token_program, fee_recipient) {
+            (Some(curve), Some(token_program), Some(fee_recipient)) => Some(execution::BondingCurveContext {
+                virtual_token_reserves: curve.virtual_token_reserves,
+                virtual_sol_reserves: curve.virtual_sol_reserves,
+                creator: curve.creator,
+                fee_recipient,
+                token_program,
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    match executor.execute(&order, mark_price, state.decimals, wallet, bonding_curve_ctx).await {
         Ok(fill) => {
             tracing::info!(
                 mint = %fill.mint, side = ?fill.side, qty = fill.qty, price = fill.price,

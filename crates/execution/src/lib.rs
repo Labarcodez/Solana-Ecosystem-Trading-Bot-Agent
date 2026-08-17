@@ -15,4 +15,4 @@ pub use error::ExecutionError;
 pub use executor::{BondingCurveContext, Executor};
 pub use jito::JitoClient;
 pub use jupiter::{JupiterClient, QuoteResponse};
-pub use pumpfun::PumpFunAccounts;
+pub use pumpfun::{decode_global_fee_recipient, global_config_pda, PumpFunAccounts};

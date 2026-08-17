@@ -36,8 +36,19 @@ pub enum WatcherEvent {
     Created { mint: Pubkey, curve_pda: Pubkey, ts: i64 },
     /// Fires on *every* bonding-curve balance change, not just graduation -
     /// this is the live pre-graduation price feed. `price_sol_per_token` is
-    /// the spot price implied by the curve's current virtual reserves.
-    CurvePriceUpdate { curve_pda: Pubkey, price_sol_per_token: f64, ts: i64 },
+    /// the spot price implied by the curve's current virtual reserves. The
+    /// raw reserves and `creator` are carried alongside the price so a
+    /// caller building a live trade (see `execution::BondingCurveContext`)
+    /// doesn't need a second RPC round trip to re-fetch what this update
+    /// already decoded.
+    CurvePriceUpdate {
+        curve_pda: Pubkey,
+        price_sol_per_token: f64,
+        virtual_token_reserves: u64,
+        virtual_sol_reserves: u64,
+        creator: Pubkey,
+        ts: i64,
+    },
     CurveCompleted { curve_pda: Pubkey, ts: i64 },
 }
 
@@ -157,7 +168,14 @@ fn handle_account(account_update: yellowstone_grpc_proto::geyser::SubscribeUpdat
 
     let mut events = Vec::with_capacity(2);
     if let Some(price) = price_sol_per_token(&state) {
-        events.push(WatcherEvent::CurvePriceUpdate { curve_pda, price_sol_per_token: price, ts: now_ts });
+        events.push(WatcherEvent::CurvePriceUpdate {
+            curve_pda,
+            price_sol_per_token: price,
+            virtual_token_reserves: state.virtual_token_reserves,
+            virtual_sol_reserves: state.virtual_sol_reserves,
+            creator: state.creator,
+            ts: now_ts,
+        });
     }
     if state.complete {
         events.push(WatcherEvent::CurveCompleted { curve_pda, ts: now_ts });

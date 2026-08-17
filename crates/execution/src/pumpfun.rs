@@ -26,7 +26,10 @@
 //! transaction's instruction data. (2) pump.fun mints can be either classic
 //! SPL Token or Token-2022 (`token_program` differs) - callers must resolve
 //! the mint's actual owning program and pass it to `PumpFunAccounts::derive`
-//! rather than assuming classic SPL Token.
+//! rather than assuming classic SPL Token. (3) `decode_global_fee_recipient`'s
+//! byte offset is taken from the IDL's `Global` struct field order only -
+//! IDL-tier verification, not cross-checked against a live `Global` account
+//! fetch (same caveat as `market_data::pumpswap_pool`).
 
 use std::str::FromStr;
 
@@ -44,6 +47,19 @@ pub const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfX
 /// real transaction data byte-for-byte.
 pub const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 pub const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+/// Anchor account discriminator for `Global` (first 8 bytes of
+/// sha256("account:Global")), taken from the official IDL.
+pub const GLOBAL_ACCOUNT_DISCRIMINATOR: [u8; 8] = [167, 232, 232, 177, 200, 108, 114, 127];
+
+/// Byte offset of `fee_recipient` within a decoded `Global` account:
+/// discriminator(8) + initialized(bool, 1) + authority(pubkey, 32) puts
+/// `fee_recipient` at 41..73. Taken from the IDL's `Global` struct field
+/// order, not independently cross-checked against a live account fetch in
+/// this sandbox (no RPC key was available) - same verification tier as
+/// `market_data::pumpswap_pool`, documented honestly rather than assumed.
+const GLOBAL_FEE_RECIPIENT_OFFSET: usize = 8 + 1 + 32;
+const GLOBAL_ACCOUNT_MIN_LEN: usize = GLOBAL_FEE_RECIPIENT_OFFSET + 32;
 
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -70,6 +86,35 @@ pub fn bonding_curve_pda(mint: &Pubkey) -> Pubkey {
 
 fn global_pda(program_id: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"global"], program_id).0
+}
+
+/// Public accessor for the pump.fun `Global` config account's address -
+/// what a caller needs to fetch it live (via RPC `getAccountInfo`) to decode
+/// the current `fee_recipient` with [`decode_global_fee_recipient`].
+pub fn global_config_pda() -> Pubkey {
+    global_pda(&parse(PUMPFUN_PROGRAM_ID))
+}
+
+/// Decodes the current `fee_recipient` out of a fetched `Global` account's
+/// raw data - this is the value `PumpFunAccounts::derive` needs and that
+/// this module cannot hardcode (it can rotate; see module docs for why it's
+/// not a static constant). Checks the account discriminator first so a
+/// wrong-shaped account fails cleanly rather than yielding a garbage pubkey.
+pub fn decode_global_fee_recipient(data: &[u8]) -> Result<Pubkey, ExecutionError> {
+    if data.len() < GLOBAL_ACCOUNT_MIN_LEN {
+        return Err(ExecutionError::UnexpectedResponse(format!(
+            "Global account data too short: {} bytes (expected at least {GLOBAL_ACCOUNT_MIN_LEN})",
+            data.len()
+        )));
+    }
+    if data[0..8] != GLOBAL_ACCOUNT_DISCRIMINATOR {
+        return Err(ExecutionError::UnexpectedResponse(
+            "account data does not match the Global account discriminator".into(),
+        ));
+    }
+    let bytes: [u8; 32] =
+        data[GLOBAL_FEE_RECIPIENT_OFFSET..GLOBAL_FEE_RECIPIENT_OFFSET + 32].try_into().expect("length checked");
+    Ok(Pubkey::from(bytes))
 }
 
 fn event_authority_pda(program_id: &Pubkey) -> Pubkey {
@@ -487,6 +532,38 @@ mod tests {
     /// `Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y` respectively) -
     /// confirming they're global PDAs with no per-mint/per-user component,
     /// matching what their IDL seed lists say (`const` seeds only).
+    fn fake_global_account(fee_recipient: Pubkey) -> Vec<u8> {
+        let mut data = vec![0u8; GLOBAL_ACCOUNT_MIN_LEN];
+        data[0..8].copy_from_slice(&GLOBAL_ACCOUNT_DISCRIMINATOR);
+        data[GLOBAL_FEE_RECIPIENT_OFFSET..GLOBAL_FEE_RECIPIENT_OFFSET + 32].copy_from_slice(fee_recipient.as_ref());
+        data
+    }
+
+    #[test]
+    fn decodes_fee_recipient_at_the_right_offset() {
+        let fee_recipient = Pubkey::new_unique();
+        let data = fake_global_account(fee_recipient);
+        assert_eq!(decode_global_fee_recipient(&data).unwrap(), fee_recipient);
+    }
+
+    #[test]
+    fn rejects_global_account_data_with_the_wrong_discriminator() {
+        let mut data = fake_global_account(Pubkey::new_unique());
+        data[0] ^= 0xFF;
+        assert!(decode_global_fee_recipient(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_short_global_account_data() {
+        assert!(decode_global_fee_recipient(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn global_config_pda_matches_manual_derivation() {
+        let program = parse(PUMPFUN_PROGRAM_ID);
+        assert_eq!(global_config_pda(), global_pda(&program));
+    }
+
     #[test]
     fn global_pdas_match_addresses_observed_in_real_transactions() {
         let program = parse(PUMPFUN_PROGRAM_ID);

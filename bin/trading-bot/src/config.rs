@@ -60,19 +60,21 @@ impl RiskSection {
     }
 }
 
-/// Read in full (matching `config.toml`) even though `main.rs` doesn't
-/// consume every field yet - `--price-source live` in this build only logs
-/// a "needs your own credentials" warning rather than driving a live
-/// discovery/safety pipeline (see README for what's wired vs. documented as
-/// a follow-up). Kept as a complete mirror of the config file now so wiring
-/// the live path later doesn't require touching this struct.
+/// Mirrors `[discovery]`. `enabled` and `watch_pumpfun_bonding_curve` gate
+/// `--price-source live`'s pump.fun watcher (see `live_pipeline.rs`).
+/// `watch_pumpswap`/`watch_raydium`/`watch_orca` are read but not yet acted
+/// on - live discovery only covers pump.fun-native tokens in this build
+/// (see README for the documented gap: a token's live price feed stops the
+/// moment it graduates, since PumpSwap/Raydium pool discovery isn't wired).
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct DiscoverySection {
     pub enabled: bool,
     pub watch_pumpfun_bonding_curve: bool,
+    #[allow(dead_code)]
     pub watch_pumpswap: bool,
+    #[allow(dead_code)]
     pub watch_raydium: bool,
+    #[allow(dead_code)]
     pub watch_orca: bool,
 }
 
