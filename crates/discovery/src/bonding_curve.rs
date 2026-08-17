@@ -18,6 +18,12 @@ pub const CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 
 pub const BONDING_CURVE_ACCOUNT_MIN_LEN: usize = 8 + 8 + 8 + 8 + 8 + 8 + 1 + 32;
 
+/// Every pump.fun bonding-curve token is created with 6 decimals - a fixed
+/// protocol convention (the standard `create` instruction always mints
+/// with this many decimals), not something that varies per-token the way
+/// migrated-token decimals can.
+pub const PUMPFUN_TOKEN_DECIMALS: u8 = 6;
+
 #[derive(Debug, Clone, Copy)]
 pub struct BondingCurveState {
     pub virtual_token_reserves: u64,
@@ -26,6 +32,7 @@ pub struct BondingCurveState {
     pub real_sol_reserves: u64,
     pub token_total_supply: u64,
     pub complete: bool,
+    pub creator: Pubkey,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +46,7 @@ pub fn decode_bonding_curve(data: &[u8]) -> Result<BondingCurveState, BondingCur
         return Err(BondingCurveError::ShortData { len: data.len() });
     }
     let u64_at = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().expect("checked len"));
+    let creator_bytes: [u8; 32] = data[0x31..0x31 + 32].try_into().expect("checked len");
     Ok(BondingCurveState {
         virtual_token_reserves: u64_at(0x08),
         virtual_sol_reserves: u64_at(0x10),
@@ -46,7 +54,23 @@ pub fn decode_bonding_curve(data: &[u8]) -> Result<BondingCurveState, BondingCur
         real_sol_reserves: u64_at(0x20),
         token_total_supply: u64_at(0x28),
         complete: data[0x30] != 0,
+        creator: Pubkey::from(creator_bytes),
     })
+}
+
+/// Spot price in SOL per token from the curve's current virtual reserves -
+/// the same constant-product ratio `execution::pumpfun::quote_buy`/
+/// `quote_sell` are built on, just expressed as a price rather than a
+/// trade quote. Returns `None` if the curve has no token reserves left to
+/// price against (shouldn't happen pre-graduation, but division by zero is
+/// avoided rather than assumed away).
+pub fn price_sol_per_token(state: &BondingCurveState) -> Option<f64> {
+    if state.virtual_token_reserves == 0 {
+        return None;
+    }
+    let sol_ui = state.virtual_sol_reserves as f64 / 1_000_000_000.0;
+    let token_ui = state.virtual_token_reserves as f64 / 10f64.powi(PUMPFUN_TOKEN_DECIMALS as i32);
+    Some(sol_ui / token_ui)
 }
 
 /// Derives the bonding-curve PDA for `mint` under the pump.fun program,
@@ -85,10 +109,20 @@ mod tests {
         virtual_sol_reserves: u64,
         complete: bool,
     ) -> Vec<u8> {
+        fake_bonding_curve_with_creator(virtual_token_reserves, virtual_sol_reserves, complete, Pubkey::new_unique())
+    }
+
+    fn fake_bonding_curve_with_creator(
+        virtual_token_reserves: u64,
+        virtual_sol_reserves: u64,
+        complete: bool,
+        creator: Pubkey,
+    ) -> Vec<u8> {
         let mut data = vec![0u8; BONDING_CURVE_ACCOUNT_MIN_LEN];
         data[0x08..0x10].copy_from_slice(&virtual_token_reserves.to_le_bytes());
         data[0x10..0x18].copy_from_slice(&virtual_sol_reserves.to_le_bytes());
         data[0x30] = complete as u8;
+        data[0x31..0x31 + 32].copy_from_slice(creator.as_ref());
         data
     }
 
@@ -111,6 +145,30 @@ mod tests {
     #[test]
     fn rejects_short_data() {
         assert!(matches!(decode_bonding_curve(&[0u8; 10]), Err(BondingCurveError::ShortData { .. })));
+    }
+
+    #[test]
+    fn decodes_the_creator_field() {
+        let creator = Pubkey::new_unique();
+        let data = fake_bonding_curve_with_creator(1, 1, false, creator);
+        let state = decode_bonding_curve(&data).unwrap();
+        assert_eq!(state.creator, creator);
+    }
+
+    #[test]
+    fn price_matches_the_virtual_reserve_ratio() {
+        // 1,000,000 tokens (6 decimals -> 1.0 UI token) against 30 SOL virtual reserves.
+        let data = fake_bonding_curve(1_000_000, 30_000_000_000, false);
+        let state = decode_bonding_curve(&data).unwrap();
+        let price = price_sol_per_token(&state).unwrap();
+        assert!((price - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_is_none_for_a_fully_drained_curve() {
+        let data = fake_bonding_curve(0, 30_000_000_000, false);
+        let state = decode_bonding_curve(&data).unwrap();
+        assert!(price_sol_per_token(&state).is_none());
     }
 
     #[test]

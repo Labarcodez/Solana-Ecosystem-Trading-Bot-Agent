@@ -1,10 +1,10 @@
 //! Real-time discovery via Yellowstone gRPC: subscribes to
 //! (a) transactions touching the pump.fun program, to catch `create`
 //! instructions (new token launches), and (b) account updates owned by the
-//! pump.fun program, to catch a bonding curve's `complete` flag flipping to
-//! `true` (graduation) - without needing to know every bonding-curve
-//! address up front, since Yellowstone's account filter can match by
-//! `owner` alone.
+//! pump.fun program, to catch every bonding-curve balance change (a live
+//! price feed pre-graduation) and the `complete` flag flipping to `true`
+//! (graduation) - without needing to know every bonding-curve address up
+//! front, since Yellowstone's account filter can match by `owner` alone.
 
 use std::collections::HashMap;
 
@@ -18,7 +18,7 @@ use yellowstone_grpc_proto::geyser::{
     SubscribeRequestFilterTransactions,
 };
 
-use crate::bonding_curve::{decode_bonding_curve, find_mint_and_bonding_curve, CREATE_DISCRIMINATOR};
+use crate::bonding_curve::{decode_bonding_curve, find_mint_and_bonding_curve, price_sol_per_token, CREATE_DISCRIMINATOR};
 use crate::error::DiscoveryError;
 
 pub struct GrpcConfig {
@@ -28,19 +28,23 @@ pub struct GrpcConfig {
 
 /// A raw sighting from the gRPC stream, before it's been resolved against
 /// the `MintRegistry`. Kept separate from `registry::DiscoveryEvent` because
-/// a curve-completion sighting only carries the curve's own pubkey - only
-/// the registry (which remembers mint<->curve pairs from the `create`
-/// sighting) can resolve that back to a mint.
+/// a curve-account sighting only carries the curve's own pubkey - only the
+/// registry (which remembers mint<->curve pairs from the `create` sighting)
+/// can resolve that back to a mint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WatcherEvent {
     Created { mint: Pubkey, curve_pda: Pubkey, ts: i64 },
+    /// Fires on *every* bonding-curve balance change, not just graduation -
+    /// this is the live pre-graduation price feed. `price_sol_per_token` is
+    /// the spot price implied by the curve's current virtual reserves.
+    CurvePriceUpdate { curve_pda: Pubkey, price_sol_per_token: f64, ts: i64 },
     CurveCompleted { curve_pda: Pubkey, ts: i64 },
 }
 
 /// Connects and streams `WatcherEvent`s on `events_tx` until `shutdown` is
-/// cancelled or the stream ends. Resolving these into `DiscoveryEvent`s
-/// (and deciding what to do with them) is the caller's job - see
-/// `Discovery::apply_watcher_event` in `lib.rs`.
+/// cancelled or the stream ends. Resolving these into `DiscoveryEvent`s /
+/// `PriceTick`s (and deciding what to do with them) is the caller's job -
+/// see `Discovery::apply_watcher_event` in `lib.rs`.
 pub async fn watch(
     cfg: GrpcConfig,
     program_id: Pubkey,
@@ -92,7 +96,7 @@ pub async fn watch(
                 let Some(update) = update else { break };
                 let update = update.map_err(|e| DiscoveryError::Grpc(e.to_string()))?;
                 let now_ts = chrono::Utc::now().timestamp();
-                if let Some(event) = handle_update(update, &program_id, now_ts) {
+                for event in handle_update(update, &program_id, now_ts) {
                     let _ = events_tx.send(event);
                 }
             }
@@ -111,11 +115,11 @@ fn handle_update(
     update: yellowstone_grpc_proto::geyser::SubscribeUpdate,
     program_id: &Pubkey,
     now_ts: i64,
-) -> Option<WatcherEvent> {
-    match update.update_oneof? {
-        UpdateOneof::Transaction(tx_update) => handle_transaction(tx_update, program_id, now_ts),
-        UpdateOneof::Account(account_update) => handle_account(account_update, now_ts),
-        _ => None,
+) -> Vec<WatcherEvent> {
+    match update.update_oneof {
+        Some(UpdateOneof::Transaction(tx_update)) => handle_transaction(tx_update, program_id, now_ts).into_iter().collect(),
+        Some(UpdateOneof::Account(account_update)) => handle_account(account_update, now_ts),
+        _ => vec![],
     }
 }
 
@@ -143,17 +147,22 @@ fn handle_transaction(
     None
 }
 
-fn handle_account(
-    account_update: yellowstone_grpc_proto::geyser::SubscribeUpdateAccount,
-    now_ts: i64,
-) -> Option<WatcherEvent> {
-    let info = account_update.account?;
-    let state = decode_bonding_curve(&info.data).ok()?;
-    if !state.complete {
-        return None;
+/// Every successfully-decoded bonding-curve account update yields a price
+/// tick; a `complete = true` reading additionally yields a graduation
+/// event - both can fire from the same update.
+fn handle_account(account_update: yellowstone_grpc_proto::geyser::SubscribeUpdateAccount, now_ts: i64) -> Vec<WatcherEvent> {
+    let Some(info) = account_update.account else { return vec![] };
+    let Ok(state) = decode_bonding_curve(&info.data) else { return vec![] };
+    let Some(curve_pda) = pubkey_from_bytes(&info.pubkey) else { return vec![] };
+
+    let mut events = Vec::with_capacity(2);
+    if let Some(price) = price_sol_per_token(&state) {
+        events.push(WatcherEvent::CurvePriceUpdate { curve_pda, price_sol_per_token: price, ts: now_ts });
     }
-    let curve_pda = pubkey_from_bytes(&info.pubkey)?;
-    Some(WatcherEvent::CurveCompleted { curve_pda, ts: now_ts })
+    if state.complete {
+        events.push(WatcherEvent::CurveCompleted { curve_pda, ts: now_ts });
+    }
+    events
 }
 
 #[cfg(test)]
@@ -165,6 +174,14 @@ mod tests {
         SubscribeUpdateTransactionInfo,
     };
     use yellowstone_grpc_proto::solana::storage::confirmed_block::{CompiledInstruction, Message, Transaction};
+
+    fn fake_curve_data(virtual_token_reserves: u64, virtual_sol_reserves: u64, complete: bool) -> Vec<u8> {
+        let mut data = vec![0u8; crate::bonding_curve::BONDING_CURVE_ACCOUNT_MIN_LEN];
+        data[0x08..0x10].copy_from_slice(&virtual_token_reserves.to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&virtual_sol_reserves.to_le_bytes());
+        data[0x30] = complete as u8;
+        data
+    }
 
     #[test]
     fn detects_create_instruction_and_extracts_mint() {
@@ -195,8 +212,8 @@ mod tests {
             ..Default::default()
         };
 
-        let event = handle_update(update, &program_id, 1000);
-        assert_eq!(event, Some(WatcherEvent::Created { mint, curve_pda, ts: 1000 }));
+        let events = handle_update(update, &program_id, 1000);
+        assert_eq!(events, vec![WatcherEvent::Created { mint, curve_pda, ts: 1000 }]);
     }
 
     #[test]
@@ -217,48 +234,62 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert!(handle_update(update, &program_id, 1000).is_none());
+        assert!(handle_update(update, &program_id, 1000).is_empty());
     }
 
     #[test]
-    fn detects_graduation_from_a_completed_bonding_curve_account() {
-        let mut data = vec![0u8; crate::bonding_curve::BONDING_CURVE_ACCOUNT_MIN_LEN];
-        data[0x30] = 1; // complete = true
+    fn active_curve_update_emits_only_a_price_tick() {
+        let data = fake_curve_data(1_000_000, 30_000_000_000, false);
         let curve_pubkey = Pubkey::new_unique();
-
         let update = SubscribeUpdate {
             update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
-                account: Some(SubscribeUpdateAccountInfo {
-                    pubkey: curve_pubkey.to_bytes().to_vec(),
-                    data,
-                    ..Default::default()
-                }),
+                account: Some(SubscribeUpdateAccountInfo { pubkey: curve_pubkey.to_bytes().to_vec(), data, ..Default::default() }),
                 slot: 1,
                 is_startup: false,
             })),
             ..Default::default()
         };
         let program_id = Pubkey::new_unique();
-        let event = handle_update(update, &program_id, 2000);
-        assert_eq!(event, Some(WatcherEvent::CurveCompleted { curve_pda: curve_pubkey, ts: 2000 }));
+        let events = handle_update(update, &program_id, 2000);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], WatcherEvent::CurvePriceUpdate { .. }));
     }
 
     #[test]
-    fn incomplete_bonding_curve_account_produces_no_event() {
-        let data = vec![0u8; crate::bonding_curve::BONDING_CURVE_ACCOUNT_MIN_LEN]; // complete = false
+    fn graduation_update_emits_both_a_price_tick_and_a_completion_event() {
+        let data = fake_curve_data(1_000_000, 30_000_000_000, true);
+        let curve_pubkey = Pubkey::new_unique();
         let update = SubscribeUpdate {
             update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
-                account: Some(SubscribeUpdateAccountInfo {
-                    pubkey: Pubkey::new_unique().to_bytes().to_vec(),
-                    data,
-                    ..Default::default()
-                }),
+                account: Some(SubscribeUpdateAccountInfo { pubkey: curve_pubkey.to_bytes().to_vec(), data, ..Default::default() }),
                 slot: 1,
                 is_startup: false,
             })),
             ..Default::default()
         };
         let program_id = Pubkey::new_unique();
-        assert!(handle_update(update, &program_id, 2000).is_none());
+        let events = handle_update(update, &program_id, 2000);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| matches!(e, WatcherEvent::CurvePriceUpdate { .. })));
+        assert!(events.contains(&WatcherEvent::CurveCompleted { curve_pda: curve_pubkey, ts: 2000 }));
+    }
+
+    #[test]
+    fn a_drained_curve_with_no_price_still_reports_completion() {
+        // virtual_token_reserves = 0 -> price_sol_per_token returns None,
+        // but graduation must still be reported.
+        let data = fake_curve_data(0, 30_000_000_000, true);
+        let curve_pubkey = Pubkey::new_unique();
+        let update = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
+                account: Some(SubscribeUpdateAccountInfo { pubkey: curve_pubkey.to_bytes().to_vec(), data, ..Default::default() }),
+                slot: 1,
+                is_startup: false,
+            })),
+            ..Default::default()
+        };
+        let program_id = Pubkey::new_unique();
+        let events = handle_update(update, &program_id, 2000);
+        assert_eq!(events, vec![WatcherEvent::CurveCompleted { curve_pda: curve_pubkey, ts: 2000 }]);
     }
 }

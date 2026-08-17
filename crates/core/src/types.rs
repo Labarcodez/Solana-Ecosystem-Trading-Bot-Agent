@@ -56,7 +56,7 @@ pub struct TokenMeta {
 
 /// A single price observation for a mint, in SOL (or `base_currency` from
 /// config) per token.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PriceTick {
     pub mint: Pubkey,
     pub price: f64,

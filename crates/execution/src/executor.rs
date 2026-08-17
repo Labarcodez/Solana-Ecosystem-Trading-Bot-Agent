@@ -7,8 +7,10 @@
 use std::str::FromStr;
 
 use bot_core::{ApprovedOrder, Fill, Side, TokenPhase};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::instruction::Instruction;
 use solana_sdk::signature::{Keypair, Signer};
-use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::transaction::{Transaction, VersionedTransaction};
 use solana_system_interface::instruction as system_instruction;
 
 use crate::error::ExecutionError;
@@ -18,17 +20,31 @@ use crate::pumpfun::{self, PumpFunAccounts};
 
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+const JITO_TIP_LAMPORTS: u64 = 10_000;
 
 /// Everything about the bonding curve's current state the executor needs
 /// for a pump.fun quote/trade - supplied by the caller (from
 /// `market_data`/`discovery`'s last-known reading or a fresh RPC fetch)
 /// rather than fetched internally, so `Executor` doesn't need its own RPC
-/// client just for this.
+/// client just for pricing.
 #[derive(Debug, Clone, Copy)]
 pub struct BondingCurveContext {
     pub virtual_token_reserves: u64,
     pub virtual_sol_reserves: u64,
+    /// From the bonding-curve account's own `creator` field (see
+    /// `discovery::bonding_curve::BondingCurveState::creator`) - required
+    /// to derive `creator_vault`.
     pub creator: bot_core::Pubkey,
+    /// The `global` config account's current `fee_recipient`. Best sourced
+    /// from a recent real transaction or the `global` account itself; the
+    /// caller is expected to keep this current since it's not something
+    /// `Executor` looks up on its own.
+    pub fee_recipient: bot_core::Pubkey,
+    /// Whichever SPL token program actually owns this mint - pump.fun
+    /// mints can be classic SPL Token or Token-2022, and the associated
+    /// token account addresses differ depending on which (see
+    /// `pumpfun::TOKEN_PROGRAM_ID` / `TOKEN_2022_PROGRAM_ID`).
+    pub token_program: bot_core::Pubkey,
 }
 
 pub struct Executor {
@@ -36,15 +52,25 @@ pub struct Executor {
     jito: JitoClient,
     dry_run: bool,
     wsol_mint: bot_core::Pubkey,
+    /// Needed only for the live pump.fun path, to fetch a recent blockhash
+    /// for a self-built transaction (the Jupiter path doesn't need this -
+    /// Jupiter's `/swap` response already embeds a valid blockhash).
+    /// Defaults to `ALCHEMY_RPC_URL` from the environment.
+    rpc_url: Option<String>,
 }
 
 impl Executor {
     pub fn new(dry_run: bool) -> Self {
+        Self::with_rpc_url(dry_run, std::env::var("ALCHEMY_RPC_URL").ok())
+    }
+
+    pub fn with_rpc_url(dry_run: bool, rpc_url: Option<String>) -> Self {
         Self {
             jupiter: JupiterClient::new(),
             jito: JitoClient::new(),
             dry_run,
             wsol_mint: bot_core::Pubkey::from_str(WSOL_MINT).expect("valid static mint"),
+            rpc_url,
         }
     }
 
@@ -70,7 +96,7 @@ impl Executor {
                 let ctx = bonding_curve.ok_or_else(|| {
                     ExecutionError::UnexpectedResponse("bonding-curve order requires BondingCurveContext".into())
                 })?;
-                self.execute_bonding_curve(order, mark_price, mint_decimals, ctx, wallet)
+                self.execute_bonding_curve(order, mark_price, mint_decimals, ctx, wallet).await
             }
         }
     }
@@ -107,12 +133,19 @@ impl Executor {
             return Err(ExecutionError::UnexpectedResponse("live execution requires an unlocked wallet".into()));
         };
         let swap_tx_b64 = self.jupiter.swap_transaction_base64(&quote, &wallet.pubkey()).await?;
-        let bundle_id = self.sign_and_submit_via_jito(swap_tx_b64, wallet).await?;
+        let bundle_id = self.sign_and_submit_jupiter_via_jito(swap_tx_b64, wallet).await?;
         tracing::info!(mint = %order.mint, bundle_id, "submitted live swap via Jito bundle");
         Ok(fill_from_jupiter_quote(order, &quote, mint_decimals, false, Some(bundle_id)))
     }
 
-    fn execute_bonding_curve(
+    /// Live path is IDL-verified as of this pass (see `pumpfun.rs` module
+    /// docs for exactly what was cross-checked against real mainnet
+    /// transactions and what residual uncertainty remains). Still gated
+    /// behind having a real wallet and an RPC URL to fetch a blockhash from -
+    /// neither of which this sandbox has, so this path is real, complete,
+    /// unit-tested code that has not itself been exercised against mainnet
+    /// with real funds.
+    async fn execute_bonding_curve(
         &self,
         order: &ApprovedOrder,
         mark_price: f64,
@@ -142,47 +175,75 @@ impl Executor {
             return Ok(fill_from_bonding_curve_quote(order, qty_in, out_raw, mint_decimals, is_buy, true, None));
         }
 
-        let Some(_wallet) = wallet else {
+        let Some(wallet) = wallet else {
             return Err(ExecutionError::UnexpectedResponse("live execution requires an unlocked wallet".into()));
         };
-        // Building + submitting a live bonding-curve instruction is
-        // deliberately not wired further than this in the current build -
-        // `PumpFunAccounts`' account list needs the live-transaction
-        // verification called out in `pumpfun.rs` before it's trusted with
-        // real funds. `mode = "live"` on a bonding-curve token is rejected
-        // here rather than silently attempting an unverified instruction.
-        Err(ExecutionError::UnexpectedResponse(
-            "live bonding-curve trading requires verifying PumpFunAccounts against a real transaction first (see pumpfun.rs docs) - not enabled in this build".into(),
-        ))
+        let Some(rpc_url) = &self.rpc_url else {
+            return Err(ExecutionError::UnexpectedResponse(
+                "live bonding-curve trading requires an RPC URL (ALCHEMY_RPC_URL) to fetch a recent blockhash".into(),
+            ));
+        };
+
+        let accounts =
+            PumpFunAccounts::derive(order.mint, wallet.pubkey(), ctx.creator, ctx.fee_recipient, ctx.token_program);
+        let slippage = order.max_slippage_bps as f64 / 10_000.0;
+        let ix = if is_buy {
+            let max_sol_cost = (qty_in as f64 * (1.0 + slippage)).round() as u64;
+            let min_token_out = (out_raw as f64 * (1.0 - slippage)).round() as u64;
+            pumpfun::buy_instruction(&accounts, min_token_out, max_sol_cost)
+        } else {
+            let min_sol_output = (out_raw as f64 * (1.0 - slippage)).round() as u64;
+            pumpfun::sell_instruction(&accounts, qty_in, min_sol_output)
+        };
+
+        let rpc = RpcClient::new(rpc_url.clone());
+        let recent_blockhash =
+            rpc.get_latest_blockhash().await.map_err(|e| ExecutionError::UnexpectedResponse(e.to_string()))?;
+
+        let bundle_id = self.sign_and_submit_legacy_via_jito(ix, wallet, recent_blockhash).await?;
+        tracing::info!(mint = %order.mint, bundle_id, "submitted live pump.fun trade via Jito bundle");
+        Ok(fill_from_bonding_curve_quote(order, qty_in, out_raw, mint_decimals, is_buy, false, Some(bundle_id)))
     }
 
-    /// Signs `swap_tx_b64` with `wallet`, wraps it with a Jito tip transfer,
-    /// and submits the bundle. Real, complete code - exercised only when
-    /// the user runs `mode = "live"` with real funds, matching the user's
-    /// own stated cost model (gas/tips are the only real cost).
-    async fn sign_and_submit_via_jito(&self, swap_tx_b64: String, wallet: &Keypair) -> Result<String, ExecutionError> {
+    /// Builds and signs the Jito tip transfer every live bundle needs -
+    /// shared by both the Jupiter and pump.fun live paths.
+    async fn tip_transaction(&self, wallet: &Keypair, recent_blockhash: solana_sdk::hash::Hash) -> Result<Transaction, ExecutionError> {
+        let tip_accounts = self.jito.get_tip_accounts().await?;
+        let tip_account =
+            tip_accounts.first().copied().ok_or_else(|| ExecutionError::Jito("no tip accounts returned".into()))?;
+        let tip_ix = system_instruction::transfer(&wallet.pubkey(), &tip_account, JITO_TIP_LAMPORTS);
+        Ok(Transaction::new_signed_with_payer(&[tip_ix], Some(&wallet.pubkey()), &[wallet], recent_blockhash))
+    }
+
+    /// Signs `swap_tx_b64` (from Jupiter's `/swap`) with `wallet`, wraps it
+    /// with a Jito tip transfer, and submits the bundle.
+    async fn sign_and_submit_jupiter_via_jito(&self, swap_tx_b64: String, wallet: &Keypair) -> Result<String, ExecutionError> {
         let tx_bytes = base64_decode(&swap_tx_b64)?;
         let versioned_tx: VersionedTransaction =
             bincode::deserialize(&tx_bytes).map_err(|e| ExecutionError::UnexpectedResponse(e.to_string()))?;
         let signed = sign_versioned_transaction(versioned_tx, wallet)?;
-
-        let tip_accounts = self.jito.get_tip_accounts().await?;
-        let tip_account = tip_accounts
-            .first()
-            .copied()
-            .ok_or_else(|| ExecutionError::Jito("no tip accounts returned".into()))?;
-        let tip_ix = system_instruction::transfer(&wallet.pubkey(), &tip_account, 10_000);
-        let recent_blockhash = signed.message.recent_blockhash().to_owned();
-        let tip_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-            &[tip_ix],
-            Some(&wallet.pubkey()),
-            &[wallet],
-            recent_blockhash,
-        );
-
+        let recent_blockhash = *signed.message.recent_blockhash();
+        let tip_tx = self.tip_transaction(wallet, recent_blockhash).await?;
         let signed_txs = vec![
-            bs58::encode(bincode::serialize(&tip_tx).unwrap()).into_string(),
-            bs58::encode(bincode::serialize(&signed).unwrap()).into_string(),
+            bs58::encode(bincode::serialize(&tip_tx).expect("transaction serializes")).into_string(),
+            bs58::encode(bincode::serialize(&signed).expect("transaction serializes")).into_string(),
+        ];
+        self.jito.send_bundle(signed_txs).await
+    }
+
+    /// Builds, signs, and submits a self-constructed legacy `Transaction`
+    /// (the pump.fun bonding-curve path) wrapped with a Jito tip transfer.
+    async fn sign_and_submit_legacy_via_jito(
+        &self,
+        ix: Instruction,
+        wallet: &Keypair,
+        recent_blockhash: solana_sdk::hash::Hash,
+    ) -> Result<String, ExecutionError> {
+        let main_tx = Transaction::new_signed_with_payer(&[ix], Some(&wallet.pubkey()), &[wallet], recent_blockhash);
+        let tip_tx = self.tip_transaction(wallet, recent_blockhash).await?;
+        let signed_txs = vec![
+            bs58::encode(bincode::serialize(&tip_tx).expect("transaction serializes")).into_string(),
+            bs58::encode(bincode::serialize(&main_tx).expect("transaction serializes")).into_string(),
         ];
         self.jito.send_bundle(signed_txs).await
     }
@@ -229,7 +290,7 @@ fn fill_from_jupiter_quote(
         price,
         sol_amount,
         fee_sol: 0.0, // Jupiter's fee is embedded in the quote; not separately itemized here
-        jito_tip_sol: if dry_run { 0.0 } else { 10_000.0 / LAMPORTS_PER_SOL },
+        jito_tip_sol: if dry_run { 0.0 } else { JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL },
         slippage_bps: Some(order.max_slippage_bps),
         strategy: order.strategy.clone(),
         reason: order.reason,
@@ -267,7 +328,7 @@ fn fill_from_bonding_curve_quote(
         price,
         sol_amount,
         fee_sol: 0.0,
-        jito_tip_sol: if dry_run { 0.0 } else { 10_000.0 / LAMPORTS_PER_SOL },
+        jito_tip_sol: if dry_run { 0.0 } else { JITO_TIP_LAMPORTS as f64 / LAMPORTS_PER_SOL },
         slippage_bps: Some(order.max_slippage_bps),
         strategy: order.strategy.clone(),
         reason: order.reason,
@@ -276,13 +337,6 @@ fn fill_from_bonding_curve_quote(
         dry_run,
         ts: order.ts,
     }
-}
-
-/// Referenced so `PumpFunAccounts`/`BondingCurveContext` stay linked for
-/// callers assembling a full live bonding-curve trade later.
-pub fn pumpfun_accounts_for(order: &ApprovedOrder, wallet: bot_core::Pubkey, ctx: &BondingCurveContext) -> PumpFunAccounts {
-    let fee_recipient = ctx.creator; // best-effort placeholder - see pumpfun.rs verification note
-    PumpFunAccounts::derive(order.mint, wallet, ctx.creator, fee_recipient)
 }
 
 #[cfg(test)]
@@ -309,34 +363,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dry_run_bonding_curve_buy_produces_a_real_computed_fill() {
-        let exec = Executor::new(true);
-        let mint = Pubkey::new_unique();
-        let ctx = BondingCurveContext {
+    fn ctx() -> BondingCurveContext {
+        BondingCurveContext {
             virtual_token_reserves: 1_000_000_000,
             virtual_sol_reserves: 30_000_000_000,
             creator: Pubkey::new_unique(),
-        };
+            fee_recipient: Pubkey::new_unique(),
+            token_program: pumpfun::TOKEN_PROGRAM_ID.parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_bonding_curve_buy_produces_a_real_computed_fill() {
+        let exec = Executor::with_rpc_url(true, None);
+        let mint = Pubkey::new_unique();
         let ord = order(Side::Buy, mint, 1.0);
-        let fill = exec.execute_bonding_curve(&ord, 0.0, 6, ctx, None).unwrap();
+        let fill = exec.execute_bonding_curve(&ord, 0.0, 6, ctx(), None).await.unwrap();
         assert!(fill.dry_run);
         assert!(fill.qty > 0.0);
         assert_eq!(fill.side, Side::Buy);
     }
 
-    #[test]
-    fn live_bonding_curve_without_verified_accounts_is_refused() {
-        let exec = Executor::new(false);
+    #[tokio::test]
+    async fn live_bonding_curve_without_wallet_is_refused() {
+        let exec = Executor::with_rpc_url(false, Some("https://example.invalid".into()));
         let mint = Pubkey::new_unique();
-        let ctx = BondingCurveContext {
-            virtual_token_reserves: 1_000_000_000,
-            virtual_sol_reserves: 30_000_000_000,
-            creator: Pubkey::new_unique(),
-        };
+        let ord = order(Side::Buy, mint, 1.0);
+        let result = exec.execute_bonding_curve(&ord, 0.0, 6, ctx(), None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn live_bonding_curve_without_rpc_url_is_refused() {
+        let exec = Executor::with_rpc_url(false, None);
+        let mint = Pubkey::new_unique();
         let wallet = Keypair::new();
         let ord = order(Side::Buy, mint, 1.0);
-        let result = exec.execute_bonding_curve(&ord, 0.0, 6, ctx, Some(&wallet));
-        assert!(result.is_err());
+        let result = exec.execute_bonding_curve(&ord, 0.0, 6, ctx(), Some(&wallet)).await;
+        assert!(matches!(result, Err(ExecutionError::UnexpectedResponse(msg)) if msg.contains("RPC URL")));
     }
 }
