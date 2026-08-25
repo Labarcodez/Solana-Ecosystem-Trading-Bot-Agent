@@ -1,18 +1,18 @@
-//! `execution`: Jupiter (quote/swap) + Jito (MEV-protected bundle landing)
-//! for graduated tokens, and a direct pump.fun bonding-curve client for
-//! tokens still pre-graduation (Jupiter doesn't route those - confirmed via
-//! research). `Executor` routes by `TokenMeta.phase` and treats `dry_run`
-//! as first-class: both paths make their real quote call and stop before
-//! anything is signed or submitted.
+//! `execution`: hand-rolled Kraken Spot (+ margin) and Kraken Futures REST
+//! clients, tied together behind one `Executor` that routes by
+//! `ApprovedOrder`'s `MarketType`. `dry_run` is treated as first-class
+//! everywhere: every path makes its real public-endpoint call (proving the
+//! integration is genuinely live) and stops before anything private is
+//! signed or submitted. See `kraken_spot`/`kraken_futures` module docs for
+//! exactly what's cross-checked against Kraken's own documentation versus
+//! independently verified in this session.
 
 pub mod error;
 pub mod executor;
-pub mod jito;
-pub mod jupiter;
-pub mod pumpfun;
+pub mod kraken_futures;
+pub mod kraken_spot;
 
 pub use error::ExecutionError;
-pub use executor::{BondingCurveContext, Executor};
-pub use jito::JitoClient;
-pub use jupiter::{JupiterClient, QuoteResponse};
-pub use pumpfun::{decode_global_fee_recipient, global_config_pda, PumpFunAccounts};
+pub use executor::Executor;
+pub use kraken_futures::{FuturesOrderRequest, FuturesSendOrderResult, FuturesTicker, KrakenFuturesClient};
+pub use kraken_spot::{AddOrderRequest, AddOrderResult, KrakenSpotClient, OrderType, TickerInfo};

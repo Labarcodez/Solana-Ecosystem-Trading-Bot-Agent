@@ -8,11 +8,11 @@ pub enum ExecutionError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Jupiter API error: {0}")]
-    Jupiter(String),
+    #[error("Kraken Spot API error: {0}")]
+    KrakenSpot(String),
 
-    #[error("Jito API error: {0}")]
-    Jito(String),
+    #[error("Kraken Futures API error: {0}")]
+    KrakenFutures(String),
 
     #[error("unexpected response shape: {0}")]
     UnexpectedResponse(String),
@@ -20,6 +20,9 @@ pub enum ExecutionError {
     #[error("base64 decode error: {0}")]
     Base64(String),
 
-    #[error("invalid pubkey: {0}")]
-    InvalidPubkey(String),
+    #[error("live execution requires credentials for this market type, but none were supplied")]
+    MissingCredentials,
+
+    #[error("no ticker data returned for pair {0}")]
+    NoTickerData(String),
 }

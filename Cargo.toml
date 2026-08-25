@@ -42,6 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP / WebSocket
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+serde_urlencoded = "0.7"
 
 # Crypto / key handling / Kraken request signing
 aes-gcm = "0.10"
