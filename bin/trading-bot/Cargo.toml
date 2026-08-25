@@ -13,10 +13,8 @@ path = "src/main.rs"
 bot-core = { path = "../../crates/core" }
 strategies = { path = "../../crates/strategies" }
 risk = { path = "../../crates/risk" }
-wallet = { path = "../../crates/wallet" }
+credentials = { path = "../../crates/credentials" }
 market-data = { path = "../../crates/market_data" }
-discovery = { path = "../../crates/discovery" }
-safety = { path = "../../crates/safety" }
 execution = { path = "../../crates/execution" }
 storage = { path = "../../crates/storage" }
 tui = { path = "../../crates/tui" }
@@ -31,8 +29,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
-solana-sdk.workspace = true
-solana-client.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

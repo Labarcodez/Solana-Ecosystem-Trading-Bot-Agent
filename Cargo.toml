@@ -4,10 +4,8 @@ members = [
     "crates/core",
     "crates/strategies",
     "crates/risk",
-    "crates/wallet",
+    "crates/credentials",
     "crates/market_data",
-    "crates/discovery",
-    "crates/safety",
     "crates/execution",
     "crates/storage",
     "crates/tui",
@@ -34,7 +32,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 base64 = "0.22"
-bs58 = "0.5"
 
 # Errors / logging
 thiserror = "1"
@@ -42,17 +39,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# HTTP / gRPC
+# HTTP / WebSocket
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tonic = { version = "0.12", features = ["tls-native-roots"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
-# Solana
-solana-sdk = "2"
-solana-client = "2"
-solana-system-interface = "1"
-bincode = "1"
-
-# Crypto / key handling
+# Crypto / key handling / Kraken request signing
 aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
@@ -60,6 +51,7 @@ rpassword = "7"
 zeroize = { version = "1", features = ["derive"] }
 secrecy = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 
 # Storage
 rusqlite = { version = "0.31", features = ["bundled"] }

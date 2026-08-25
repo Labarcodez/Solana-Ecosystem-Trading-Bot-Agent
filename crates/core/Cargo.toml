@@ -13,4 +13,3 @@ path = "src/lib.rs"
 serde.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
-solana-sdk.workspace = true

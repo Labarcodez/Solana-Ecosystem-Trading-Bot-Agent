@@ -13,13 +13,11 @@ path = "src/lib.rs"
 bot-core = { path = "../core" }
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-tungstenite.workspace = true
 futures.workspace = true
-solana-sdk.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 csv.workspace = true
 chrono.workspace = true
-yellowstone-grpc-client = "13"
-yellowstone-grpc-proto = "12"
-bs58.workspace = true

@@ -12,15 +12,14 @@ path = "src/lib.rs"
 [dependencies]
 bot-core = { path = "../core" }
 tokio.workspace = true
-async-trait.workspace = true
+tokio-tungstenite.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-solana-sdk.workspace = true
-solana-client.workspace = true
-solana-system-interface.workspace = true
 base64.workspace = true
-bs58.workspace = true
-bincode.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
