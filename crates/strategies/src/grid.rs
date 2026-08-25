@@ -89,7 +89,7 @@ impl Strategy for GridStrategy {
                     self.filled.insert(k, true);
                     signals.push(Signal {
                         side: Side::Buy,
-                        mint: tick.mint,
+                        pair: tick.pair.clone(),
                         strength: 0.8,
                         reason: format!("grid level {k} ({lvl:.6}) crossed falling"),
                         strategy: "grid".to_string(),
@@ -105,7 +105,7 @@ impl Strategy for GridStrategy {
                     self.filled.insert(k, false);
                     signals.push(Signal {
                         side: Side::Sell,
-                        mint: tick.mint,
+                        pair: tick.pair.clone(),
                         strength: 0.8,
                         reason: format!("grid level {k} ({lvl:.6}) crossed rising"),
                         strategy: "grid".to_string(),
@@ -134,17 +134,17 @@ impl Strategy for GridStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bot_core::Pubkey;
+    use bot_core::Pair;
 
-    fn tick(mint: Pubkey, price: f64, ts: i64) -> PriceTick {
-        PriceTick { mint, price, ts }
+    fn tick(pair: &Pair, price: f64, ts: i64) -> PriceTick {
+        PriceTick { pair: pair.clone(), price, funding_rate: None, ts }
     }
 
     #[test]
     fn first_tick_only_sets_baseline() {
         let mut s = GridStrategy::new(GridConfig::default());
-        let mint = Pubkey::new_unique();
-        assert!(s.on_price_tick(&tick(mint, 100.0, 0)).is_empty());
+        let pair = Pair::from("XBT/USD");
+        assert!(s.on_price_tick(&tick(&pair, 100.0, 0)).is_empty());
         assert_eq!(s.base_price, Some(100.0));
     }
 
@@ -156,14 +156,14 @@ mod tests {
             grid_levels: 3,
         };
         let mut s = GridStrategy::new(cfg);
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
 
-        s.on_price_tick(&tick(mint, 100.0, 0)); // base = 100
-        let buys = s.on_price_tick(&tick(mint, 97.0, 1)); // crosses -1 (98) and -2 (96)? -2 level=96, 97>96 so only -1 crossed
+        s.on_price_tick(&tick(&pair, 100.0, 0)); // base = 100
+        let buys = s.on_price_tick(&tick(&pair, 97.0, 1)); // crosses -1 (98) and -2 (96)? -2 level=96, 97>96 so only -1 crossed
         assert_eq!(buys.len(), 1);
         assert_eq!(buys[0].side, Side::Buy);
 
-        let sells = s.on_price_tick(&tick(mint, 99.5, 2)); // crosses back up through 98
+        let sells = s.on_price_tick(&tick(&pair, 99.5, 2)); // crosses back up through 98
         assert_eq!(sells.len(), 1);
         assert_eq!(sells[0].side, Side::Sell);
     }
@@ -176,24 +176,24 @@ mod tests {
             grid_levels: 3,
         };
         let mut s = GridStrategy::new(cfg);
-        let mint = Pubkey::new_unique();
-        s.on_price_tick(&tick(mint, 100.0, 0));
-        let first = s.on_price_tick(&tick(mint, 97.0, 1));
+        let pair = Pair::from("XBT/USD");
+        s.on_price_tick(&tick(&pair, 100.0, 0));
+        let first = s.on_price_tick(&tick(&pair, 97.0, 1));
         assert_eq!(first.len(), 1);
         // Wiggling above and back below the same level without crossing back
         // up through it first should not re-buy.
-        let second = s.on_price_tick(&tick(mint, 97.5, 2));
+        let second = s.on_price_tick(&tick(&pair, 97.5, 2));
         assert!(second.is_empty());
-        let third = s.on_price_tick(&tick(mint, 96.9, 3));
+        let third = s.on_price_tick(&tick(&pair, 96.9, 3));
         assert!(third.is_empty());
     }
 
     #[test]
     fn reset_clears_levels_and_baseline() {
         let mut s = GridStrategy::new(GridConfig::default());
-        let mint = Pubkey::new_unique();
-        s.on_price_tick(&tick(mint, 100.0, 0));
-        s.on_price_tick(&tick(mint, 90.0, 1));
+        let pair = Pair::from("XBT/USD");
+        s.on_price_tick(&tick(&pair, 100.0, 0));
+        s.on_price_tick(&tick(&pair, 90.0, 1));
         s.reset();
         assert!(s.base_price.is_none());
         assert!(s.filled.is_empty());
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn tighter_step_pct_produces_more_signals_over_same_path() {
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let path = [100.0, 95.0, 90.0, 85.0, 90.0, 95.0, 100.0];
 
         let mut wide = GridStrategy::new(GridConfig {
@@ -218,8 +218,8 @@ mod tests {
         let mut wide_signals = 0;
         let mut tight_signals = 0;
         for (i, price) in path.into_iter().enumerate() {
-            wide_signals += wide.on_price_tick(&tick(mint, price, i as i64)).len();
-            tight_signals += tight.on_price_tick(&tick(mint, price, i as i64)).len();
+            wide_signals += wide.on_price_tick(&tick(&pair, price, i as i64)).len();
+            tight_signals += tight.on_price_tick(&tick(&pair, price, i as i64)).len();
         }
         assert!(tight_signals > wide_signals);
     }

@@ -195,7 +195,7 @@ mod tests {
         let mut app = App::new("dry_run", "momentum");
         let mint = Pubkey::new_unique();
         for i in 0..50 {
-            app.on_price_tick(&PriceTick { mint, price: 1.0 + (i as f64) * 0.01, ts: i });
+            app.on_price_tick(&PriceTick { mint, price: 1.0 + (i as f64) * 0.01, funding_rate: None, ts: i });
         }
         app.on_app_event(&bot_core::AppEvent::Fill(bot_core::Fill {
             mint, side: bot_core::Side::Buy, qty: 5.0, price: 1.2, sol_amount: 6.0,

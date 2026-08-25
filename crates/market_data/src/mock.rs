@@ -37,7 +37,7 @@ pub async fn replay_csv(
         }
         // A send error just means there are currently no subscribers -
         // harmless for a broadcast channel, keep replaying.
-        let _ = tx.send(PriceTick { pair: pair.clone(), price, ts });
+        let _ = tx.send(PriceTick { pair: pair.clone(), price, funding_rate: None, ts });
         sent += 1;
 
         if tick_interval.is_zero() {

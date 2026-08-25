@@ -108,6 +108,13 @@ pub struct PairMeta {
 pub struct PriceTick {
     pub pair: Pair,
     pub price: f64,
+    /// Kraken Futures perpetuals only: the contract's current hourly
+    /// funding rate (a fraction, not a percent - e.g. `0.0001` = 0.01%/hr).
+    /// `None` for every spot/margin tick and for any futures tick where the
+    /// rate wasn't available. This is what `strategies::FundingCarryStrategy`
+    /// reacts to.
+    #[serde(default)]
+    pub funding_rate: Option<f64>,
     pub ts: i64,
 }
 

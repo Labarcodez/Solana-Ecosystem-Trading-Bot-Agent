@@ -113,7 +113,7 @@ impl Strategy for MomentumStrategy {
 
         vec![Signal {
             side,
-            mint: tick.mint,
+            pair: tick.pair.clone(),
             strength,
             reason: format!(
                 "SMA{} {:.6} vs SMA{} {:.6} ({:+.2}%)",
@@ -134,12 +134,13 @@ impl Strategy for MomentumStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bot_core::Pubkey;
+    use bot_core::Pair;
 
     fn tick(price: f64, ts: i64) -> PriceTick {
         PriceTick {
-            mint: Pubkey::new_unique(),
+            pair: Pair::from("XBT/USD"),
             price,
+            funding_rate: None,
             ts,
         }
     }
@@ -167,14 +168,14 @@ mod tests {
             cooldown_secs: 0,
         };
         let mut s = MomentumStrategy::new(cfg);
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let mut signals = vec![];
         // Flat prices to fill history, then a sharp rise to trigger the crossover.
         for (i, price) in [100.0, 100.0, 100.0, 100.0, 110.0, 120.0, 130.0]
             .into_iter()
             .enumerate()
         {
-            let t = PriceTick { mint, price, ts: i as i64 };
+            let t = PriceTick { pair: pair.clone(), price, funding_rate: None, ts: i as i64 };
             signals.extend(s.on_price_tick(&t));
         }
         assert_eq!(signals.len(), 1, "expected exactly one buy signal, got {signals:?}");
@@ -190,13 +191,13 @@ mod tests {
             cooldown_secs: 1000,
         };
         let mut s = MomentumStrategy::new(cfg);
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let mut signals = vec![];
         for (i, price) in [100.0, 100.0, 100.0, 100.0, 110.0, 120.0, 90.0, 80.0]
             .into_iter()
             .enumerate()
         {
-            let t = PriceTick { mint, price, ts: i as i64 };
+            let t = PriceTick { pair: pair.clone(), price, funding_rate: None, ts: i as i64 };
             signals.extend(s.on_price_tick(&t));
         }
         // Even though the trend reverses hard, the long cooldown should
@@ -208,9 +209,9 @@ mod tests {
     fn reset_clears_state() {
         let cfg = MomentumConfig::default();
         let mut s = MomentumStrategy::new(cfg.clone());
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         for i in 0..cfg.long_window {
-            s.on_price_tick(&PriceTick { mint, price: 100.0, ts: i as i64 });
+            s.on_price_tick(&PriceTick { pair: pair.clone(), price: 100.0, funding_rate: None, ts: i as i64 });
         }
         assert_eq!(s.prices.len(), cfg.long_window);
         s.reset();
@@ -224,7 +225,7 @@ mod tests {
         // This is the same honesty property the backtester acceptance check
         // relies on: parameters must actually change output.
         let prices = [100.0, 100.0, 100.0, 100.0, 101.0, 102.0, 103.0];
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
 
         let mut loose = MomentumStrategy::new(MomentumConfig {
             short_window: 2,
@@ -242,7 +243,7 @@ mod tests {
         let mut loose_signals = 0;
         let mut strict_signals = 0;
         for (i, price) in prices.into_iter().enumerate() {
-            let t = PriceTick { mint, price, ts: i as i64 };
+            let t = PriceTick { pair: pair.clone(), price, funding_rate: None, ts: i as i64 };
             loose_signals += loose.on_price_tick(&t).len();
             strict_signals += strict.on_price_tick(&t).len();
         }

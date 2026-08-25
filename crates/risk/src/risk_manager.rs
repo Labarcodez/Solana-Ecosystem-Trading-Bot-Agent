@@ -501,7 +501,7 @@ mod tests {
         let pair = Pair::from("XBT/USD");
         r.on_fill(&fill(pair.clone(), Side::Buy, 10.0, 1.0, 10.0, OrderReason::Strategy, 0));
         // Spot tier default stop loss is 8% (mandatory_stop_loss_pct = 0.0 -> use default).
-        let orders = r.on_price_tick(&PriceTick { pair, price: 0.90, ts: 1 });
+        let orders = r.on_price_tick(&PriceTick { pair, price: 0.90, funding_rate: None, ts: 1 });
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].reason, OrderReason::StopLoss);
         assert_eq!(orders[0].side, Side::Sell);
@@ -512,9 +512,9 @@ mod tests {
         let mut r = rm(100_000.0);
         let pair = Pair::from("XBT/USD");
         r.on_fill(&fill(pair.clone(), Side::Buy, 10.0, 1.0, 10.0, OrderReason::Strategy, 0));
-        let first = r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.90, ts: 1 });
+        let first = r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.90, funding_rate: None, ts: 1 });
         assert_eq!(first.len(), 1);
-        let second = r.on_price_tick(&PriceTick { pair, price: 0.80, ts: 2 });
+        let second = r.on_price_tick(&PriceTick { pair, price: 0.80, funding_rate: None, ts: 2 });
         assert!(second.is_empty(), "should not re-fire while an exit is pending");
     }
 
@@ -526,7 +526,7 @@ mod tests {
 
         r.on_fill(&fill(pair.clone(), Side::Buy, 100.0, 1.0, 10.0, OrderReason::Strategy, 0));
 
-        let orders = r.on_price_tick(&PriceTick { pair, price: 0.5, ts: 1 });
+        let orders = r.on_price_tick(&PriceTick { pair, price: 0.5, funding_rate: None, ts: 1 });
         assert_eq!(orders.len(), 1, "protective sell should still fire");
         assert!(r.is_breaker_tripped());
 
@@ -543,12 +543,12 @@ mod tests {
         let pair = Pair::from("XBT/USD");
 
         r.on_fill(&fill(pair.clone(), Side::Buy, 100.0, 1.0, 10.0, OrderReason::Strategy, 0));
-        let exits = r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.5, ts: 1 });
+        let exits = r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.5, funding_rate: None, ts: 1 });
         assert!(r.is_breaker_tripped());
         assert_eq!(exits.len(), 1);
         r.on_fill(&fill(pair.clone(), Side::Sell, 100.0, 0.5, 50.0, OrderReason::StopLoss, 1));
 
-        r.on_price_tick(&PriceTick { pair, price: 0.5, ts: 90_000 });
+        r.on_price_tick(&PriceTick { pair, price: 0.5, funding_rate: None, ts: 90_000 });
         assert!(!r.is_breaker_tripped());
     }
 
@@ -563,7 +563,7 @@ mod tests {
         let mut strict = make(0.01);
         for r in [&mut loose, &mut strict] {
             r.on_fill(&fill(pair.clone(), Side::Buy, 100.0, 1.0, 10.0, OrderReason::Strategy, 0));
-            r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.95, ts: 1 });
+            r.on_price_tick(&PriceTick { pair: pair.clone(), price: 0.95, funding_rate: None, ts: 1 });
         }
         assert!(!loose.is_breaker_tripped());
         assert!(strict.is_breaker_tripped());

@@ -72,7 +72,7 @@ fn parse_ticker_message(text: &str, now_ts: i64) -> Vec<PriceTick> {
     if msg.channel != "ticker" {
         return Vec::new();
     }
-    msg.data.into_iter().map(|d| PriceTick { pair: Pair::from(d.symbol), price: d.last, ts: now_ts }).collect()
+    msg.data.into_iter().map(|d| PriceTick { pair: Pair::from(d.symbol), price: d.last, funding_rate: None, ts: now_ts }).collect()
 }
 
 /// Connects, subscribes to `ticker` for `pairs`, and forwards resolved
