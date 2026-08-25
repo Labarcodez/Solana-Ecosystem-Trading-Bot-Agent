@@ -13,15 +13,15 @@ pub enum BreakerState {
 
 pub struct CircuitBreaker {
     state: BreakerState,
-    daily_loss_limit_sol: f64,
+    daily_loss_limit_quote: f64,
     daily_loss_limit_pct: f64,
 }
 
 impl CircuitBreaker {
-    pub fn new(daily_loss_limit_sol: f64, daily_loss_limit_pct: f64) -> Self {
+    pub fn new(daily_loss_limit_quote: f64, daily_loss_limit_pct: f64) -> Self {
         Self {
             state: BreakerState::Normal,
-            daily_loss_limit_sol,
+            daily_loss_limit_quote,
             daily_loss_limit_pct,
         }
     }
@@ -35,27 +35,27 @@ impl CircuitBreaker {
     }
 
     /// Evaluate today's PnL (realized + unrealized) against the configured
-    /// limits and trip if breached. `starting_capital_sol` is the capital
+    /// limits and trip if breached. `starting_capital_quote` is the capital
     /// the daily % limit is measured against. Returns `Some(reason)` if this
     /// call is the one that tripped the breaker (so the caller can emit an
     /// `AppEvent::CircuitBreakerTripped` exactly once).
-    pub fn check(&mut self, daily_pnl_sol: f64, starting_capital_sol: f64, ts: i64) -> Option<String> {
-        if self.is_tripped() || daily_pnl_sol >= 0.0 {
+    pub fn check(&mut self, daily_pnl_quote: f64, starting_capital_quote: f64, ts: i64) -> Option<String> {
+        if self.is_tripped() || daily_pnl_quote >= 0.0 {
             return None;
         }
-        let loss_sol = -daily_pnl_sol;
-        let loss_pct = if starting_capital_sol > 0.0 {
-            loss_sol / starting_capital_sol * 100.0
+        let loss_quote = -daily_pnl_quote;
+        let loss_pct = if starting_capital_quote > 0.0 {
+            loss_quote / starting_capital_quote * 100.0
         } else {
             0.0
         };
 
-        let breached_sol = loss_sol >= self.daily_loss_limit_sol;
+        let breached_abs = loss_quote >= self.daily_loss_limit_quote;
         let breached_pct = loss_pct >= self.daily_loss_limit_pct;
-        if breached_sol || breached_pct {
+        if breached_abs || breached_pct {
             let reason = format!(
-                "daily loss {loss_sol:.4} SOL ({loss_pct:.2}%) breached limit ({} SOL / {}%)",
-                self.daily_loss_limit_sol, self.daily_loss_limit_pct
+                "daily loss {loss_quote:.4} ({loss_pct:.2}%) breached limit ({} / {}%)",
+                self.daily_loss_limit_quote, self.daily_loss_limit_pct
             );
             self.state = BreakerState::Tripped { since_ts: ts, reason: reason.clone() };
             return Some(reason);
@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn trips_on_absolute_sol_limit() {
+    fn trips_on_absolute_quote_limit() {
         let mut b = CircuitBreaker::new(1.0, 100.0);
         assert!(b.check(-1.5, 100.0, 0).is_some());
         assert!(b.is_tripped());
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn trips_on_pct_limit() {
         let mut b = CircuitBreaker::new(1000.0, 10.0);
-        assert!(b.check(-1.5, 10.0, 0).is_some()); // 15% loss of 10 SOL capital
+        assert!(b.check(-1.5, 10.0, 0).is_some()); // 15% loss of 10 units of capital
         assert!(b.is_tripped());
     }
 
