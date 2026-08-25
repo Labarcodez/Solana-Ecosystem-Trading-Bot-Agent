@@ -1,102 +1,188 @@
-# Solana Ecosystem Trading Bot
+# Kraken Exchange Trading Bot
 
-A **local, terminal-based Solana trading bot** that runs entirely on your own
-machine. No cloud hosting, no third party ever touches your wallet key. It's
-a **multi-strategy framework**: a shared core (market data, execution, risk
-management, dashboard) that pluggable strategies (momentum, grid, more you
-write later) trade against.
+A **local, terminal-based Kraken trading bot** that runs entirely on your own
+machine. No cloud hosting, no third party ever touches your API keys. It's a
+**multi-strategy framework**: a shared core (market data, execution, risk
+management, dashboard) that pluggable strategies trade against — momentum,
+grid, market-making, triangular arbitrage, and funding-rate carry, with more
+you can write later.
 
-The bot watches Solana token prices in real time, runs your chosen strategy
-against that data, manages risk automatically (position sizing, stop-loss/
-take-profit, a daily-loss circuit breaker), executes trades through Jupiter
-with Jito MEV-protected landing, logs every trade to a local SQLite database,
-and displays it all in a live terminal dashboard. It also includes a
-backtesting engine so you can test a strategy against real historical data
-before risking anything.
+This project used to trade the Solana ecosystem through Phantom-style wallet
+signing. That approach didn't pan out, so it's been **completely rebuilt to
+trade on Kraken instead** — a regulated centralized exchange with a real
+order book, REST/WebSocket APIs, and (crucially) no wallet-signing surface to
+fight with. Nothing Solana-specific survived the rewrite: no bonding curves,
+no on-chain discovery, no rug-pull scoring. Kraken already vets what it
+lists, so that entire safety layer had no equivalent problem to solve here.
 
-It's built to trade **anything in the Solana ecosystem, including brand-new
-memecoins** — both tokens still on pump.fun's bonding curve (pre-graduation)
-and tokens that have already migrated to a real AMM pool — gated behind
-mandatory, rule-based safety checks and risk sizing that's automatically
-more conservative the less is known about a token. See
-[Honesty notes](#honesty-notes--known-limitations) below for exactly what
-that means in practice.
+The bot streams Kraken prices in real time (public WebSocket v2 for spot/
+margin, polled REST tickers for futures), runs your chosen strategy against
+that data, manages risk automatically (position sizing, stop-loss/take-
+profit, a daily-loss circuit breaker, and — new for leveraged products — a
+liquidation-distance floor), executes trades against Kraken's Spot, Margin,
+and Futures APIs, logs every trade to a local SQLite database, and displays
+it all in a live terminal dashboard. It also includes a backtesting engine
+so you can test a strategy against real historical Kraken data before
+risking anything.
 
-Everything runs at **$0 cost** using free tiers (Alchemy RPC, Shyft
-Yellowstone gRPC, Jupiter Swap API, Jito's free bundle submission). The only
-real cost is on-chain gas, priority fees, and Jito tips — your own trading
-capital being spent, not a service fee.
+Everything runs at **$0 cost** — Kraken's public market-data endpoints are
+keyless and free. The only real costs are Kraken's own trading fees (see
+[Fees](#fees-the-single-biggest-lever-a-bot-controls) below) and, if you
+trade margin or futures, financing/funding costs — your own trading capital
+being spent, not a service fee.
 
 ## Status: what actually works right now
 
-Every crate below compiles, is unit-tested, and passes clippy with zero
-warnings. **152 tests, all passing.** The full pipeline has been run
-end-to-end in `--mode dry_run --price-source mock`, including a real
-momentum-strategy buy-then-sell round trip against **live** Jupiter `/quote`
-calls (no fake data, no mocked HTTP responses at the integration level).
-`--price-source live` genuinely discovers new pump.fun tokens, safety-scores
-them, and trades whatever passes — see [Honesty
-notes](#honesty-notes--known-limitations) for exactly what's verified end-to-
-end versus what's real-but-unexercised (this sandbox never had a funded RPC
-key or real SOL to run it against).
+Every crate compiles, is unit-tested, and passes clippy with zero warnings —
+**124 tests, all passing** across the workspace. The full pipeline has been
+run end-to-end in `--mode dry_run --price-source mock`: real historical
+XBT/USD data replayed through the momentum strategy, a signal fired, the
+risk manager sized and approved an order, and the executor made a **live**
+call to Kraken's public `Ticker` endpoint to get a real fill price — no fake
+data, no mocked HTTP responses at the integration level. That run is also
+what caught and fixed a real bug this session (see
+[Honesty notes](#honesty-notes--known-limitations)): Kraken's classic REST
+API rejects the slash-separated pair spelling its own WebSocket v2 API
+requires, so the client now converts at its own boundary.
 
 Read [Honesty notes](#honesty-notes--known-limitations) before you point
-this at real funds — it explains precisely what's fully wired for live
-trading today versus what's real-but-not-yet-connected.
+this at real funds — it explains precisely what's live-verified from this
+sandbox versus what needs your own funded Kraken API keys to exercise
+further.
+
+## How this bot tries to make money on Kraken
+
+This isn't "buy low sell high" hand-waving — every mechanism below is a
+specific, concrete thing the code does, grounded in how Kraken's API and fee
+structure actually work (see [Sources](#sources) for what was researched
+before building this).
+
+### Fees: the single biggest lever a bot controls
+Kraken charges **maker vs. taker fees** — a base tier of 0.25% maker /
+0.40% taker, improving with 30-day volume down to 0.00%/0.05% at high tiers.
+A **maker** order (one that adds liquidity to the book — a limit order that
+doesn't immediately cross the spread) is cheaper than a **taker** order (one
+that removes liquidity — a market order, or a limit order that crosses
+immediately) on every single trade, before any strategy edge is even
+considered. Kraken also supports **post-only** orders, which are rejected
+outright rather than silently converted to taker if they'd cross — a hard
+guarantee of maker pricing.
+
+`execution::Executor` encodes this as policy, not as an afterthought: every
+strategy-driven entry/exit (`OrderReason::Strategy`) is placed as a
+**post-only limit order joining the current best bid/ask** — a real maker
+fill. Every *protective* exit (`StopLoss`, `TakeProfit`, `LiquidationGuard`)
+is placed as a **market order** — because a stop-loss that fails to fill
+because the market moved away from a resting limit order isn't a stop-loss.
+`backtester::SimulatedExecutor` mirrors this exactly (maker fee + zero
+slippage for strategy fills, taker fee + slippage for protective exits), so
+backtest numbers reflect the same fee structure live trading will actually
+pay.
+
+### Market making (`strategies::market_maker`)
+Quotes around the current price: buys when flat, then sells once
+`target_spread_pct` of favorable movement is captured, both legs as
+post-only makers. This is the most direct way to harvest Kraken's
+maker-rebate-relative-to-taker economics on a liquid pair like `XBT/USD` —
+it doesn't need to predict direction, just capture spread + rebate on
+round trips, with a requote cooldown so it doesn't flip-flop on noise.
+
+### Triangular arbitrage (`strategies::triangular_arbitrage`)
+Compares a pair's actual price (e.g. `ETH/XBT`) against the rate implied by
+two other pairs (`ETH/USD` / `XBT/USD`) and trades when the mispricing
+exceeds `min_mispricing_pct`. **Honestly scoped**: this is a single-leg
+relative-value signal on the third pair, not an atomic, simultaneous 3-leg
+arbitrage execution — Kraken has no batch/atomic cross-pair order primitive
+this bot uses, so there's real execution-lag risk between legs. Documented
+in the module itself, not just here.
+
+### Funding-rate carry (`strategies::funding_carry`)
+Kraken Futures perpetuals pay/charge **funding** hourly between longs and
+shorts (capped ±0.50%/hr) to keep the perpetual's price anchored to spot.
+When funding is persistently positive beyond `min_funding_rate_pct`, longs
+are being paid — this strategy goes long to collect it, and exits (never
+shorts, see the long-only limitation below) when funding flips unfavorable.
+**Honestly scoped**: a real funding-carry trade is normally *hedged*
+(long spot + short perp, market-neutral, funding is the entire return).
+This bot's long-only architecture (below) can't represent that hedge, so
+what's implemented is a directional tilt informed by funding, not a
+market-neutral carry trade — real but a materially smaller edge than the
+textbook version. Documented in the module itself.
+
+### Margin and futures: real leverage, real liquidation risk
+`AddOrderRequest.leverage` turns a plain Spot order into a Margin order via
+Kraken's own single-endpoint design (there's no separate margin API to
+call). Kraken Futures is a genuinely separate product with its own host and
+auth scheme (`crates/execution/src/kraken_futures.rs`). Leverage amplifies
+both the strategies above and their downside, so `crates/risk` enforces,
+per market type (`[risk.tiers.spot/margin/futures]`):
+- a hard **leverage cap**,
+- a mandatory **liquidation-distance floor** — an order is rejected if its
+  approximate liquidation distance (`100 / leverage`, a conservative,
+  explicitly-simplified model — see the honesty note below) is closer than
+  the configured minimum,
+- a `LiquidationGuard` exit that fires as a market order the moment price
+  crosses the position's estimated liquidation price, checked every tick
+  alongside stop-loss/take-profit.
+
+None of this is a promise of profit — leverage on Kraken can and does
+liquidate positions. The risk tiers exist to make that a bounded, sized risk
+rather than an unbounded one.
 
 ## Architecture
 
 ```
-discovery::pumpfun_watcher (Yellowstone) ──WatcherEvent──▶ live_pipeline coordinator
-  (create / curve price update / graduation)      (bin/trading-bot)  │
-                                                                      ├─▶ safety::RuleBasedScorer, per new token
-                                                                      │     passed → TradableTokens map + TokenDiscovered
-                                                                      │     failed → TokenRejectedBySafety
-                                                                      └─▶ PriceTick (broadcast) — only forwarded for
-                                                                          mints already in TradableTokens
-
-PriceTick (broadcast) ──┬─▶ strategy_engine
-                         ├─▶ risk_manager (SL/TP fires every tick, not signal-gated)
-                         ├─▶ tui
-                         └─▶ storage
-strategy_engine ──Signal (mpsc)──▶ risk_manager (single veto point before execution;
-                                                   looks up the signal's mint in TradableTokens)
-risk_manager    ──ApprovedOrder──▶ executor (routes by TokenMeta.phase:
-                                              bonding_curve → pump.fun client
-                                              migrated       → Jupiter + Jito)
+config/config.toml [kraken] pairs/futures_pairs
+        │
+        ▼
+static Pair→PairMeta map (built once at startup — no discovery pipeline)
+        │
+        ▼
+market_data: Kraken WebSocket v2 (spot/margin ticker stream)
+             + polled Kraken Futures REST tickers (funding rate)
+        │
+        ▼  PriceTick (broadcast)
+        ├─▶ strategy_engine (momentum / grid / market_maker /
+        │                    triangular_arbitrage / funding_carry)
+        ├─▶ risk_manager (SL/TP/LiquidationGuard fire every tick)
+        ├─▶ tui
+        └─▶ storage
+strategy_engine ──Signal (mpsc)──▶ risk_manager (single veto point: position
+                                    sizing, leverage cap, liquidation-distance
+                                    floor, daily-loss circuit breaker)
+risk_manager    ──ApprovedOrder──▶ executor (routes by PairMeta.market_type:
+                                    spot/margin → Kraken Spot REST,
+                                    futures     → Kraken Futures REST;
+                                    maker post-only for strategy orders,
+                                    taker market for protective exits)
 executor        ──AppEvent (broadcast)──┬─▶ storage
   (Fill / Rejected / CircuitBreaker)    ├─▶ tui
-                                        ├─▶ risk_manager (feedback: PnL/positions)
+                                        ├─▶ risk_manager (feedback: PnL/funding)
                                         └─▶ telegram (optional)
 ```
 
-A newly-seen mint only ever becomes tradable after `safety` clears it —
-nothing downstream can bypass that gate: the coordinator only forwards
-price ticks (and therefore only gives `strategy_engine` anything to react
-to) for mints already in `TradableTokens`. `risk` is the single point
-between a strategy's signal and the executor: no code path reaches
-`execution` without going through it first. In `--price-source mock`, the
-same `TradableTokens` map is seeded with one hardcoded asset instead of
-being populated by discovery — everything downstream is identical either
-way. `--mode dry_run` (the default) prevents any of this from ever signing
-or submitting a real transaction, regardless of price source.
+`risk` is the single point between a strategy's signal and the executor: no
+code path reaches `execution` without going through it first. In
+`--price-source mock`, the same static pair map is seeded from
+`[kraken].pairs`/config defaults instead of a live WebSocket feed —
+everything downstream is identical either way. `--mode dry_run` (the
+default) makes real, live Kraken **public** API calls but never signs or
+submits a private order, regardless of price source.
 
 ### Workspace layout
 
 | Crate | Responsibility |
 |---|---|
-| `crates/core` (`bot-core`) | Domain types (`PriceTick`, `Signal`, `Fill`, `TokenMeta`, `TrustTier`, ...) + the `Strategy` trait. Zero I/O dependencies. |
-| `crates/strategies` | `MomentumStrategy` (SMA crossover) and `GridStrategy`, plus the `build_strategy()` factory both binaries use — this is what guarantees live and backtest runs execute identical strategy logic. |
-| `crates/risk` | `RiskManager`: per-trust-tier position sizing, stop-loss/take-profit, the daily-loss circuit breaker. |
-| `crates/wallet` | Argon2id + AES-256-GCM encrypted keypair, interactive passphrase prompts. |
-| `crates/market_data` | Real Yellowstone gRPC price streaming (generic vault-ratio pricing, works across any constant-product AMM) + a PumpSwap `Pool`-account decoder + a CSV mock-replay source. |
-| `crates/discovery` | Real-time pump.fun `create`/graduation watcher via Yellowstone gRPC — also emits a live price tick on every bonding-curve balance change, not just at graduation. |
-| `crates/safety` | `TokenSafetyScorer` trait + `RuleBasedScorer` (mint/freeze authority, LP burn, holder concentration, liquidity, age). |
-| `crates/execution` | Jupiter (quote/swap), Jito (bundle landing), and a direct pump.fun bonding-curve client (IDL- and live-transaction-verified), routed by token phase. |
+| `crates/core` (`bot-core`) | Domain types (`Pair`, `PriceTick`, `Signal`, `Fill`, `MarketType`, `RiskTier`, ...) + the `Strategy` trait. Zero I/O dependencies. |
+| `crates/strategies` | `MomentumStrategy`, `GridStrategy`, `MarketMakerStrategy`, `TriangularArbitrageStrategy`, `FundingCarryStrategy`, plus the `build_strategy()` factory both binaries use — this is what guarantees live and backtest runs execute identical strategy logic. |
+| `crates/risk` | `RiskManager`: per-risk-tier position sizing, stop-loss/take-profit, leverage caps, liquidation-distance floor + guard, the daily-loss circuit breaker (now funding-aware). |
+| `crates/credentials` | Argon2id + AES-256-GCM encrypted Kraken API key/secret pair, interactive passphrase prompts. |
+| `crates/market_data` | Kraken WebSocket v2 public ticker client + a CSV mock-replay source (real Kraken OHLC history). |
+| `crates/execution` | Hand-rolled Kraken Spot REST client (public `Ticker`, private `AddOrder`/`CancelOrder`/`Balance`, HMAC-SHA512 signing) and Kraken Futures REST client (separate host/auth), routed by `Executor` per `MarketType`, with the maker/taker order-type policy described above. |
 | `crates/storage` | SQLite trade/position/equity/event log, on its own dedicated thread. |
 | `crates/tui` | The Ratatui dashboard. |
-| `crates/backtester` | Replays historical data through the *same* `Strategy`/`RiskManager` code the live bot uses. |
-| `bin/trading-bot` | The live binary — wires everything above together, including `live_pipeline.rs`'s discovery → safety → dynamic watchlist → execution glue for `--price-source live`. |
+| `crates/backtester` | Replays historical data through the *same* `Strategy`/`RiskManager` code the live bot uses, including margin carrying-cost modeling. |
+| `bin/trading-bot` | The live binary — wires everything above together. |
 | `bin/backtest` | Thin CLI around `crates/backtester`. |
 
 ## Quick start
@@ -110,180 +196,171 @@ cargo build --workspace
 # 2. Run the test suite
 cargo test --workspace
 
-# 3. Backtest a strategy against the bundled real historical data
+# 3. Backtest a strategy against the bundled real historical Kraken data
 cargo run --bin backtest -- --config config/config.toml
 
 # 4. Run the full live-shaped pipeline with zero API keys and zero cost:
-#    replays real historical SOL/USD data, runs your strategy, sizes and
-#    "fills" trades via a REAL Jupiter /quote call, but never signs or
-#    submits anything on-chain.
+#    replays real historical XBT/USD data (from Kraken's own public OHLC
+#    endpoint), runs your strategy, sizes and "fills" trades via a REAL
+#    Kraken /Ticker call, but never signs or submits a private order.
 cargo run --bin trading-bot -- run --price-source mock --no-tui
 # drop --no-tui to see the live dashboard (needs a real terminal)
 ```
 
 ### Going live
 
-1. `cargo run --bin trading-bot -- wallet init` — generates a new keypair,
-   prompts for a passphrase (twice, never echoed), and writes an encrypted
-   key file. Needs a real terminal (passphrase prompting requires a TTY).
-2. Fund that wallet's address with SOL.
-3. Copy `.env.example` to `.env` and fill in your free API keys (Alchemy,
-   Shyft — see the comments in that file for where to get them).
-4. Set `mode = "live"` in `config/config.toml` (or pass `--mode live`).
+1. On [kraken.com](https://kraken.com) → Settings → API, create a new key
+   with **only**: Query Funds, Query Open & Closed Orders, Create & Modify
+   Orders.
+
+   **Never grant "Withdraw Funds" to a key this bot holds.** A bot that can
+   place and cancel orders can be limited to trading your own account's
+   capital around; a bot that can also withdraw can move that capital
+   somewhere else entirely if the key or the machine holding it is ever
+   compromised. This is the single most important operational-security
+   decision in this whole setup.
+
+   If you plan to trade Kraken Futures, create a **second**, separate key
+   for that (Kraken's own recommendation) with the equivalent Futures
+   permissions — never Withdraw there either.
+2. `cargo run --bin trading-bot -- credentials init` — prompts for that API
+   key/secret and a passphrase (twice, never echoed), and writes an
+   encrypted file. Needs a real terminal. Add `--futures` to initialize the
+   separate Futures credentials file.
+3. Copy `.env.example` to `.env` — it just points at the encrypted
+   credential file paths (no raw secrets ever go in `.env` or
+   `config.toml`).
+4. Set `mode = "live"` in `config/config.toml` (or pass `--mode live`), and
+   configure `[kraken]` with the pairs you actually want to trade.
 5. **Read the [honesty notes](#honesty-notes--known-limitations) below
-   first** — several pieces of live trading need one more step from you
-   before they're safe to trust with real funds.
+   first** — it explains exactly what's live-verified from this sandbox
+   versus what needs your own funded account to exercise further.
 6. `cargo run --bin trading-bot -- run --price-source live`
 
 ## Configuration
 
 Two files, split deliberately:
 
-- **`.env`** (gitignored; copy from `.env.example`) — secrets: RPC URLs,
-  API keys, the encrypted wallet path, optional Telegram credentials.
+- **`.env`** (gitignored; copy from `.env.example`) — just the paths to
+  your encrypted Kraken credential files, plus optional Telegram alert
+  credentials. No raw API keys or secrets ever live in a file that could
+  accidentally get committed.
 - **`config/config.toml`** (committed) — everything else: which strategy
-  runs, its parameters, risk limits (including per-trust-tier overrides),
-  discovery/safety thresholds, execution slippage, and backtest settings.
+  runs and its parameters, risk limits (including per-risk-tier overrides
+  for spot/margin/futures), the static tradable pair list, execution
+  slippage, and backtest settings.
 
-See the comments in `config/config.toml` for every field. The trust-tier
+See the comments in `config/config.toml` for every field. The risk-tier
 system (`[risk.tiers.*]`) is the mechanism that makes the bot automatically
-size positions smaller and enforce tighter stop-losses for tokens it knows
-less about (still on pump.fun's bonding curve, or just-graduated) versus
-ones with an established track record.
+size positions smaller, enforce tighter stop-losses, and demand a wider
+liquidation cushion the more leverage a position carries — spot is the
+loosest tier (no liquidation risk at all), futures the tightest.
+
+### Why a static pair list instead of auto-discovering new listings
+The Solana build watched pump.fun for brand-new, unvetted token launches —
+that's what made a real-time discovery-and-safety-scoring pipeline
+necessary. Kraken lists new assets rarely, after its own listing review, so
+there's no equivalent firehose of unvetted new markets to watch for. This
+build trades a **configured pair list** (`[kraken].pairs`/`futures_pairs`)
+instead — simpler, and there was no real problem left for a discovery
+watcher to solve here.
 
 ## Testing / verification
 
 ```bash
-cargo test --workspace          # 152 tests, every crate
-cargo clippy --workspace --all-targets   # zero warnings
+cargo test --workspace                     # 124 tests, every crate
+cargo clippy --workspace --all-targets     # zero warnings
 cargo run --bin backtest -- --config config/config.toml --json
 cargo run --bin trading-bot -- run --price-source mock --no-tui
 ```
 
-Try varying `threshold_pct` (momentum) or `grid_step_pct` (grid) in
-`config.toml` between backtest runs — the report numbers visibly change,
-which is the acceptance check that they're computed from your parameters,
-not hardcoded.
+Try varying `threshold_pct` (momentum), `grid_step_pct` (grid), or
+`target_spread_pct` (market maker) in `config.toml` between backtest runs —
+the report numbers visibly change, which is the acceptance check that
+they're computed from your parameters, not hardcoded.
 
 ## Honesty notes / known limitations
 
 This section exists so you know exactly what you're trusting before you
-point real funds at this. Everything below is a deliberate, documented
-scope decision made during a single build session — not a bug report.
+point real funds at this. Everything below is a deliberate, documented scope
+decision — not a bug report.
 
 ### What's real and live-verified this session
-- **Jupiter Swap API** (`lite-api.jup.ag`) — confirmed live and keyless;
-  the mock/dry-run pipeline makes real `/quote` calls.
-- **Jito Block Engine** — confirmed live (`getTipAccounts` returned real
-  tip account addresses); bundle *submission* needs real funds to exercise
-  further, matching the project's own $0-except-gas cost model.
-- **Yellowstone gRPC** (`market_data`, `discovery`) — built and compiled
-  against the real `yellowstone-grpc-client`/`-proto` crates, decode logic
-  unit-tested against constructed real-shaped fixtures. Live streaming
-  needs your own free Shyft `x-token`.
-- **Solana RPC calls** (`safety::fetcher`, `live_pipeline`, `execution`) —
-  real `get_account`/`get_token_largest_accounts`/`get_latest_blockhash`
-  calls against whatever RPC you configure, for safety scoring, resolving
-  a discovered token's owning SPL program, fetching pump.fun's
-  `fee_recipient`, and building live transactions.
-- **pump.fun bonding-curve program** (`execution::pumpfun`) — account list
-  and PDA derivations verified against the official Anchor IDL *and* two
-  real mainnet `buy`/`sell` transactions (see the dedicated section below
-  for exactly what was and wasn't cross-checked).
+- **Kraken public REST** (`api.kraken.com/0/public/Ticker`, `/OHLC`) —
+  confirmed live and keyless; the mock/dry-run pipeline makes a real
+  `Ticker` call for every fill, and `data/sample_xbtusd.csv` is 721 hours
+  of real XBT/USD closes pulled live from Kraken's own `OHLC` endpoint this
+  session (not a fabricated or third-party sample).
+- **Kraken public WebSocket v2** (`wss://ws.kraken.com/v2`) — confirmed
+  live via a raw TLS handshake returning HTTP 101 this session; the ticker
+  message parser is tested against Kraken's own documented example payload.
+- **A real bug was caught by actually running the pipeline, not just unit
+  tests**: Kraken's classic REST API rejects the slash-separated pair
+  spelling (`"XBT/USD"` → `EQuery:Unknown asset pair`) that its own
+  WebSocket v2 API requires (confirmed via direct `curl` against both).
+  `crates/execution::kraken_spot::rest_pair_symbol` converts at the REST
+  client's own boundary so the rest of the codebase can carry one spelling
+  end-to-end. Re-verified after the fix: a full dry-run momentum
+  buy-then-sell round trip now completes against the live `Ticker`
+  endpoint with no error.
+- **Request signing is independently cross-checked, not just
+  self-consistent** — Kraken Spot's HMAC-SHA512 signing was checked against
+  Kraken's own published worked example (secret/path/nonce/postdata from
+  their docs) via an independent Python computation matching bit-for-bit.
+  Kraken Futures' signing algorithm has **no official worked example
+  published**, so it's only cross-checked for internal self-consistency
+  (same inputs → same signature, different inputs → different signature) —
+  a weaker verification tier, called out explicitly rather than implied to
+  be equally strong.
 
-### The rule-based safety scorer is v1, not ML
-You asked for the bot to eventually "learn and trade." A genuine ML
-rug/quality model needs training data and infrastructure this build can't
-honestly produce in one session. `safety::RuleBasedScorer` is real and
-deterministic (mint/freeze authority, LP burn, holder concentration,
-liquidity, age) and sits behind the `TokenSafetyScorer` trait — the exact
-seam a learned scorer would plug into later without any pipeline redesign.
-Rule-based-only for now; documented explicitly rather than overstated.
+### What's real but not exercised against a funded account
+No funded Kraken API key was available in this sandbox. Everything above
+covers what's genuinely live-verifiable without one. What's real,
+complete, and unit-tested — but has not itself placed a live order:
+- **`AddOrder`/`CancelOrder`/`Balance` (Spot and Margin)** — request
+  building and signing match Kraken's documented format; response parsing
+  is tested against realistic fixture JSON. `dry_run` builds and would-sign
+  these requests but always stops short of sending them.
+- **Kraken Futures `sendorder`/`cancelorder`** — same status: real,
+  fixture-tested, unexercised against a live account.
+- **Live balance lookup** (`fetch_live_balance_quote`) — tries a small,
+  documented set of heuristic asset-code spellings (`USD`, `ZUSD`, `XUSD`)
+  against Kraken's `Balance` response keys. This is **not** a complete
+  Kraken asset-code table; an unusual base currency may need the heuristic
+  extended.
 
-### `--price-source live` is now wired end-to-end — with real, named gaps
-`bin/trading-bot/src/live_pipeline.rs` spawns `discovery::pumpfun_watcher`,
-runs every newly-created pump.fun token through `safety::RuleBasedScorer`
-against real on-chain state, and adds whatever passes to a shared,
-dynamically-growing tradable-token map that `strategy`/`risk`/`execution`
-read from exactly the way they read the single hardcoded mock-mode asset.
-A token that fails safety emits `TokenRejectedBySafety` and is never added.
-This closes what used to be the biggest gap in this document. What's still
-real-but-unexercised, and what's still genuinely missing:
-- **Never run against mainnet with real funds or a live gRPC connection.**
-  No funded RPC key or Shyft `x-token` was available in this sandbox. The
-  wiring is verified as far as it can be here: it refuses cleanly and
-  specifically (missing-env-var errors naming exactly which var) when
-  `SHYFT_GRPC_ENDPOINT`/`SHYFT_X_TOKEN`/`ALCHEMY_RPC_URL` aren't set, and
-  the full mock-mode pipeline (identical downstream code path) is verified
-  live end-to-end.
-- **A token's live price feed stops at graduation.** `TokenGraduated`
-  still updates the token's `TokenPhase`/`TrustTier` in place, and the
-  event is logged loudly (a `Warn`-level `AppEvent::Log`, not silence), but
-  PumpSwap pool discovery for the newly-migrated pool isn't wired into the
-  live price feed (see the PumpSwap section below) — so strategy signals
-  and, more importantly, **stop-loss/take-profit monitoring for any open
-  position in that token pause** until this is extended. Treat a graduation
-  during an open live position as something to watch for manually today.
-- **pump.fun's `fee_recipient` is resolved once at startup**, retried every
-  30s until it succeeds, and then never refreshed again for the rest of the
-  run. If pump.fun rotates it mid-run, live bonding-curve trades fail
-  cleanly (a specific, logged error) rather than using a stale value — but
-  they do fail until a restart.
-- **Generic (non-pump.fun) new-pool discovery isn't implemented.**
-  `discovery` watches pump.fun's `create` and graduation events — the
-  overwhelming majority of new Solana memecoin launches. A token that skips
-  pump.fun entirely and launches straight on Raydium/Orca isn't auto-
-  discovered; it can still be traded via a manually configured entry.
+### The long-only architecture can't represent a true hedge or a short
+A `Signal` only ever opens via `Buy` and closes via `Sell` — there is no
+short-selling representation anywhere in the pipeline. This is why
+`funding_carry` is documented above as a directional tilt rather than a
+true hedged carry trade, and why margin/futures in this build are
+long-leverage-only, not short-capable. Extending to real shorts would touch
+`core::types::Signal`, every strategy, and both `risk`/`execution` — a
+larger change than this rebuild's scope.
 
-### pump.fun bonding-curve trading is IDL- and live-transaction-verified
-`execution::pumpfun`'s account list, PDA derivations, and instruction
-discriminators were rebuilt from pump.fun's official Anchor IDL and then
-cross-checked against two real, successful mainnet `buy`/`sell`
-transactions fetched over public RPC — the decoded account list matched
-the IDL account-for-account, and two of the derived global PDAs
-(`event_authority`, `global_volume_accumulator`) match the exact addresses
-observed on those real transactions (asserted in a regression test).
-`Executor::execute_bonding_curve` now genuinely builds, signs, and submits
-a live pump.fun trade rather than refusing outright. Residual, explicitly
-documented uncertainty:
-- The exact byte encoding of `buy`'s third argument (`track_volume`, an
-  Anchor `OptionBool`) follows Anchor's standard `Option<T>` convention but
-  wasn't independently decoded byte-for-byte from a real transaction's raw
-  instruction data.
-- `decode_global_fee_recipient`'s byte offset into the `Global` account is
-  taken from the IDL's field order only, not cross-checked against a live
-  account fetch (no RPC key was available in this sandbox).
-- None of this has been exercised against mainnet with real funds — it's
-  real, complete, unit-tested code that has not itself landed a live trade.
+### The liquidation-price model is a deliberate simplification
+`risk::approx_liquidation_distance_pct(leverage) = 100.0 / leverage` is a
+naive, symmetric approximation — **not** Kraken's actual maintenance-margin
+schedule, which varies by asset, position size, and account-wide margin
+usage. It's used as a conservative mandatory floor (reject if the
+approximate distance is too tight), not as a precise prediction of Kraken's
+real liquidation price. Treat the `LiquidationGuard` as a safety net with
+margin for the model's own imprecision, not an exact trigger.
 
-Migrated-token trading via Jupiter has none of these caveats — Jupiter's
-`/quote`/`/swap` endpoints are used as documented, with a live `/quote`
-call made even in dry-run.
-
-### The PumpSwap pool decoder exists but isn't wired into live price discovery
-`market_data::pumpswap_pool::decode_pool_account` decodes a PumpSwap `Pool`
-account into its two vault addresses — everything `pool_price` needs to
-watch a migrated token's live price. Its byte layout is taken from
-PumpSwap's official IDL only; unlike pump.fun's bonding-curve accounts,
-it was **not** independently cross-checked against a live transaction's raw
-bytes this session (fetching one hit Solana's multi-address-lookup-table
-resolution being ambiguous over the public RPC available here). It's also
-not yet connected to anything that discovers *which* Pool account belongs
-to a given migrated mint — that discovery step (subscribing to PumpSwap
-pool-creation, matching by `base_mint`) is what a future pass would need to
-add to close the "price feed stops at graduation" gap above.
-
-### The backtester models fees/slippage, not order-book depth
-`SimulatedExecutor` applies a configurable slippage % + fee bps + Jito tip
-to every fill. It does not model real-time route price impact or
-order-book depth the way a live Jupiter quote does. Good enough to compare
-strategies against each other on the same data; not a claim of full market
+### The backtester models fees and financing, not order-book depth
+`SimulatedExecutor` applies configurable maker/taker fees (mirroring the
+executor's real maker/taker policy) plus a slippage % on taker fills, and
+`engine::margin_carrying_cost` charges estimated daily interest on the
+borrowed portion of a leveraged position. It does not model real-time
+order-book depth or price impact the way a live Kraken order actually
+would. Good enough to compare strategies against each other and get a
+realistic fee/financing-adjusted picture; not a claim of full market
 realism.
 
 ### The TUI needs a real terminal
 `crossterm`'s raw-mode terminal and `rpassword`'s passphrase prompt both
-require a real TTY — neither works in a non-interactive/CI environment.
-The dashboard's rendering logic is verified with `ratatui::backend::TestBackend`
+require a real TTY — neither works in a non-interactive/CI environment. The
+dashboard's rendering logic is verified with `ratatui::backend::TestBackend`
 (real assertions on rendered buffer content, no TTY needed) and the full
 pipeline is verified headless via `--no-tui`; the visual dashboard itself
 needs you to run it in your own terminal.
@@ -294,17 +371,41 @@ formatting is unit-tested. It only activates if you set
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` in `.env`. Actually delivering a
 message needs your own bot token, which this sandbox doesn't have.
 
-### Wallet key zeroization caveat
-Decrypted key buffers are wrapped in `Zeroizing`/explicitly zeroized
-immediately after constructing the `solana_sdk::signature::Keypair`. That
-`Keypair`'s own internal storage isn't itself guaranteed zeroize-aware —
-full guaranteed zeroization through third-party internals can't be claimed,
-only of the intermediate buffers this code directly controls.
+### Credentials zeroization
+`KrakenCredentials` holds the API key and secret in `Zeroizing<String>`
+end-to-end — this crate fully controls its own memory (a genuine
+improvement over the old Solana build's `solana_sdk::Keypair`, whose
+internal storage wasn't itself guaranteed zeroize-aware). The encrypted
+file on disk uses the same Argon2id (OWASP interactive baseline) +
+AES-256-GCM scheme as before; a wrong passphrase is rejected with a clear
+error rather than silently producing garbage credentials.
 
 ## Safety
 
-This bot can lose money, especially trading brand-new, thinly-traded, or
-scam tokens — that's the nature of what you asked it to do. Start with
-`--price-source mock` and `mode = "dry_run"`. Only fund the wallet with
-capital you can afford to lose. The daily-loss circuit breaker and
-per-trust-tier position limits are safety nets, not guarantees.
+This bot can lose money — including all of it, faster than spot, if you
+enable margin or futures leverage. Start with `--price-source mock` and
+`mode = "dry_run"`. Only fund your Kraken account with capital you can
+afford to lose. The daily-loss circuit breaker, per-risk-tier position
+limits, and the liquidation-distance floor are safety nets, not guarantees.
+**Never grant a bot-held API key "Withdraw Funds" permission** — see
+[Going live](#going-live) above.
+
+## Sources
+
+Research consulted while designing the Kraken integration and the
+"how to make money on Kraken" strategies above:
+
+- [Kraken API | REST, WebSocket and FIX APIs](https://www.kraken.com/features/trading-api)
+- [Spot REST Authentication | Kraken API Center](https://docs.kraken.com/api/docs/guides/spot-rest-auth/)
+- [Trading | Kraken API Center](https://docs.kraken.com/api/docs/category/rest-api/trading/)
+- [Fee Structures | Kraken](https://www.kraken.com/features/fee-schedule)
+- [Ticker (Level 1) | Kraken API Center](https://docs.kraken.com/api/docs/websocket-v2/ticker/)
+- [Candles (OHLC) | Kraken API Center](https://docs.kraken.com/api/docs/websocket-v2/ohlc/)
+- [Spot REST Rate Limits | Kraken API Center](https://docs.kraken.com/api/docs/guides/spot-rest-ratelimits/)
+- [Margin trading pairs and their maximum leverage | Kraken](https://support.kraken.com/articles/227876608-margin-trading-pairs-and-their-maximum-leverage)
+- [Get Tradable Asset Pairs - Kraken Developers](https://docs.kraken.com/api-reference/market-data/get-tradable-asset-pairs)
+- [A Quick Primer on Funding Rates - Kraken Blog](https://blog.kraken.com/product/quick-primer-on-funding-rates)
+- [Send order | Kraken API Center](https://docs.kraken.com/api/docs/futures-api/trading/send-order/)
+- [Cancel order - Kraken Futures API](https://docs.kraken.com/api/docs/futures-api/trading/cancel-order/)
+- [API key permissions - Kraken Developers](https://docs.kraken.com/exchange/guides/rest/api-keys)
+- [Order types & options | Kraken](https://support.kraken.com/sections/200577136-order-types)
