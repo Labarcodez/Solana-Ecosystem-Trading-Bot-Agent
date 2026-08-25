@@ -1,25 +1,26 @@
-//! `trading-bot`: wires discovery -> safety -> market_data -> strategy ->
-//! risk -> execution -> storage (-> tui) into one running process. See
-//! README for the full architecture; this file is the glue, not where the
-//! interesting logic lives - that's in the library crates it calls into.
+//! `trading-bot`: wires market_data -> strategy -> risk -> execution ->
+//! storage (-> tui) into one running process, trading a static,
+//! config-driven set of Kraken pairs. See README for the full
+//! architecture; this file is the glue, not where the interesting logic
+//! lives - that's in the library crates it calls into.
 
 mod cli;
 mod config;
-mod live_pipeline;
+mod live_feed;
 mod telegram;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use bot_core::{AppEvent, LogLevel, Pubkey, TokenMeta, TokenPhase, TrustTier};
+use bot_core::{AppEvent, LogLevel, MarketType, Pair, PairMeta, RiskTier};
 use clap::Parser;
-use cli::{Cli, Command, RunArgs, WalletAction};
+use cli::{Cli, Command, CredentialsAction, RunArgs};
 use config::AppConfig;
+use credentials::KrakenCredentials;
 use risk::{RiskDecision, RiskManager};
-use solana_sdk::signature::Keypair;
-use solana_sdk::signer::Signer;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -32,28 +33,35 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Wallet { action } => run_wallet_command(action),
+        Command::Credentials { action } => run_credentials_command(action),
         Command::Run(args) => run(args).await,
     }
 }
 
-fn run_wallet_command(action: WalletAction) -> anyhow::Result<()> {
+fn run_credentials_command(action: CredentialsAction) -> anyhow::Result<()> {
     match action {
-        WalletAction::Init { path } => {
-            let path = path.unwrap_or_else(default_wallet_path);
-            println!("Creating a new encrypted wallet at {}", path.display());
-            let pubkey = wallet::init_interactive(&path).context("wallet init failed")?;
-            println!("Wallet created.");
-            println!("  Public key: {pubkey}");
-            println!("  Key file:   {}", path.display());
-            println!("Fund this address with SOL before running in live mode.");
+        CredentialsAction::Init { path, futures } => {
+            let path = path.unwrap_or_else(|| default_credentials_path(futures));
+            let label = if futures { "Futures" } else { "Spot/Margin" };
+            println!("Creating a new encrypted Kraken {label} credentials file at {}", path.display());
+            credentials::init_interactive(&path).context("credentials init failed")?;
+            println!("Credentials saved.");
+            println!("  File: {}", path.display());
+            println!();
+            println!(
+                "IMPORTANT: create this API key on kraken.com with ONLY \"Query Funds\", \"Query Open & \
+                 Closed Orders\", and \"Create & Modify Orders\" permissions. Never grant \"Withdraw \
+                 Funds\" to a key this bot holds - see README for why."
+            );
             Ok(())
         }
     }
 }
 
-fn default_wallet_path() -> PathBuf {
-    PathBuf::from(std::env::var("WALLET_KEY_PATH").unwrap_or_else(|_| "./wallet.enc.json".to_string()))
+fn default_credentials_path(futures: bool) -> PathBuf {
+    let env_var = if futures { "KRAKEN_FUTURES_CREDENTIALS_PATH" } else { "KRAKEN_CREDENTIALS_PATH" };
+    let default = if futures { "./kraken_futures.enc.json" } else { "./kraken.enc.json" };
+    PathBuf::from(std::env::var(env_var).unwrap_or_else(|_| default.to_string()))
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -74,7 +82,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         "starting trading-bot"
     );
     if dry_run {
-        tracing::info!("DRY-RUN mode: real quotes are fetched, nothing is ever signed or submitted on-chain");
+        tracing::info!("DRY-RUN mode: real Kraken ticker calls are made, nothing is ever signed or submitted");
     } else {
         tracing::warn!("LIVE mode: real trades will be submitted using real funds");
     }
@@ -82,24 +90,34 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let storage = storage::StorageHandle::spawn(&args.db_path).context("failed to open storage")?;
 
-    // --- Wallet (only unlocked for live mode) ---
-    let wallet_keypair: Option<Keypair> = if !dry_run {
-        let path = default_wallet_path();
-        Some(wallet::unlock_interactive(&path).context("failed to unlock wallet")?)
+    // --- Credentials (only unlocked for live mode) ---
+    let spot_creds: Option<KrakenCredentials> = if !dry_run {
+        let path = default_credentials_path(false);
+        Some(credentials::unlock_interactive(&path).context("failed to unlock Kraken Spot/Margin credentials")?)
+    } else {
+        None
+    };
+    let futures_creds: Option<KrakenCredentials> = if !dry_run && !cfg.kraken.futures_pairs.is_empty() {
+        let path = default_credentials_path(true);
+        Some(credentials::unlock_interactive(&path).context("failed to unlock Kraken Futures credentials")?)
     } else {
         None
     };
 
-    // --- Starting capital: real balance in live mode, configured paper
-    // capital otherwise. ---
-    let starting_capital_sol = match (&wallet_keypair, dry_run) {
-        (Some(kp), false) => fetch_live_balance_sol(kp).await.unwrap_or_else(|e| {
-            tracing::warn!("failed to fetch live SOL balance ({e}), falling back to configured starting capital");
-            args.starting_capital_sol
-        }),
-        _ => args.starting_capital_sol,
+    // --- Starting capital: real Kraken balance in live mode, configured
+    // paper capital otherwise. ---
+    let starting_capital_quote = match (&spot_creds, dry_run) {
+        (Some(creds), false) => {
+            fetch_live_balance_quote(&creds.api_key, &creds.api_secret, &cfg.general.base_currency)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("failed to fetch live Kraken balance ({e}), falling back to configured starting capital");
+                    args.starting_capital_quote
+                })
+        }
+        _ => args.starting_capital_quote,
     };
-    tracing::info!(starting_capital_sol, "capital baseline for this session");
+    tracing::info!(starting_capital_quote, "capital baseline for this session");
 
     // --- Shared buses ---
     let (price_tx, _) = broadcast::channel::<bot_core::PriceTick>(4096);
@@ -110,102 +128,75 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     // have to replay history to catch up, unlike the event log.
     let (snapshot_tx, snapshot_rx) = watch::channel(bot_core::Snapshot::default());
 
+    // --- Static tradable set. No discovery/safety pipeline in this build
+    // (see README): every pair a signal can ever be evaluated for is
+    // listed in [kraken] up front, with a fixed MarketType/leverage. ---
+    let mut pair_metas: HashMap<Pair, PairMeta> = HashMap::new();
+    for symbol in &cfg.kraken.pairs {
+        let pair = Pair::from(symbol.clone());
+        pair_metas.insert(
+            pair.clone(),
+            PairMeta { pair, market_type: cfg.kraken.market_type, risk_tier: RiskTier::from(cfg.kraken.market_type), leverage: cfg.kraken.leverage },
+        );
+    }
+    for symbol in &cfg.kraken.futures_pairs {
+        let pair = Pair::from(symbol.clone());
+        pair_metas.insert(
+            pair.clone(),
+            PairMeta { pair, market_type: MarketType::Futures, risk_tier: RiskTier::Futures, leverage: cfg.kraken.leverage },
+        );
+    }
+    // Mock mode's demo asset needs an entry too, whether or not the user
+    // configured any live pairs - real historical XBT/USD data either way.
+    let sim_pair = Pair::from(cfg.kraken.pairs.first().cloned().unwrap_or_else(|| "XBT/USD".to_string()));
+    pair_metas
+        .entry(sim_pair.clone())
+        .or_insert_with(|| PairMeta { pair: sim_pair.clone(), market_type: MarketType::Spot, risk_tier: RiskTier::Spot, leverage: 1.0 });
+    let pair_metas = Arc::new(pair_metas);
+
     // --- Market data source ---
-    // Real USDC mint (6 decimals) - data/sample_sol_usdc.csv is a real
-    // SOL/USD price series, and using an actual Jupiter-tradable mint here
-    // (rather than a random Pubkey) is what lets dry-run's real Jupiter
-    // /quote call succeed: the mock feed drives strategy/risk timing, the
-    // quote itself always reflects real live market data for whatever mint
-    // is configured, by design - these are two independent concerns.
-    let sim_mint: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        .parse()
-        .expect("valid static USDC mint");
-    const SIM_MINT_DECIMALS: u8 = 6;
-    let sim_token_meta = TokenMeta {
-        mint: sim_mint,
-        phase: TokenPhase::Migrated,
-        trust_tier: TrustTier::Established,
-        discovered_at: 0,
-        source: "mock".to_string(),
-    };
-
-    // --- Dynamic tradable-token set. In mock mode this is one hardcoded
-    // entry, seeded below. In live mode it starts empty and grows as
-    // discovery::pumpfun_watcher finds new pump.fun tokens that clear
-    // safety::RuleBasedScorer - see live_pipeline.rs. Either way, strategy/
-    // risk/execution downstream read from the same map without needing to
-    // know which price source populated it. ---
-    let tradable: live_pipeline::TradableTokens = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let mut fee_recipient_cache: Option<live_pipeline::FeeRecipientCache> = None;
-
     let market_data_task = match args.price_source.as_str() {
         "mock" => {
-            tradable.write().await.insert(
-                sim_mint,
-                live_pipeline::LiveTokenState {
-                    meta: sim_token_meta.clone(),
-                    decimals: SIM_MINT_DECIMALS,
-                    curve: None,
-                    token_program: None,
-                },
-            );
             let path = args.mock_data.clone();
             let tx = price_tx.clone();
             let sd = shutdown.clone();
             let interval = Duration::from_millis(args.mock_tick_interval_ms);
-            tracing::info!(data_file = %path.display(), "replaying mock price data (zero external API keys)");
+            let sim_pair = sim_pair.clone();
+            tracing::info!(data_file = %path.display(), pair = %sim_pair, "replaying mock price data (zero external API keys)");
             Some(tokio::spawn(async move {
-                match market_data::mock::replay_csv(&path, sim_mint, tx, interval, sd).await {
+                match market_data::mock::replay_csv(&path, sim_pair, tx, interval, sd).await {
                     Ok(n) => tracing::info!(ticks = n, "mock price replay finished"),
                     Err(e) => tracing::error!("mock price replay failed: {e}"),
                 }
             }))
         }
         "live" => {
-            if !(cfg.discovery.enabled && cfg.discovery.watch_pumpfun_bonding_curve) {
+            if cfg.kraken.pairs.is_empty() && cfg.kraken.futures_pairs.is_empty() {
                 tracing::warn!(
-                    "--price-source live requires [discovery].enabled and watch_pumpfun_bonding_curve = true in \
-                     the config file; discovery is disabled in this run's config, so no live tokens will ever \
-                     become tradable"
+                    "--price-source live requires at least one pair in [kraken].pairs or [kraken].futures_pairs; \
+                     nothing will ever become tradable this run"
                 );
                 None
             } else {
-                let grpc_endpoint = std::env::var("SHYFT_GRPC_ENDPOINT")
-                    .context("--price-source live requires SHYFT_GRPC_ENDPOINT in .env")?;
-                let grpc_x_token = std::env::var("SHYFT_X_TOKEN")
-                    .context("--price-source live requires SHYFT_X_TOKEN in .env")?;
-                let rpc_url = std::env::var("ALCHEMY_RPC_URL").context(
-                    "--price-source live requires ALCHEMY_RPC_URL in .env (used for safety scoring and \
-                     resolving pump.fun's fee_recipient)",
-                )?;
                 tracing::info!(
-                    "starting live pump.fun discovery: new bonding-curve tokens are safety-scored automatically \
-                     before becoming tradable"
+                    pairs = ?cfg.kraken.pairs, futures_pairs = ?cfg.kraken.futures_pairs,
+                    "starting live Kraken price feed (public, keyless endpoints)"
                 );
-                tracing::warn!(
-                    "PumpSwap/Raydium pool discovery for already-migrated tokens is not wired in this build - \
-                     only pump.fun-native tokens are discovered live, and a token's price feed stops the moment \
-                     it graduates (see README)"
-                );
-
-                let handles = live_pipeline::spawn(
-                    live_pipeline::LivePipelineConfig {
-                        grpc_endpoint,
-                        grpc_x_token,
-                        rpc_url,
-                        safety_cfg: cfg.safety.clone(),
+                let handles = live_feed::spawn(
+                    live_feed::LiveFeedConfig {
+                        ws_url: market_data::DEFAULT_WS_URL.to_string(),
+                        spot_pairs: cfg.kraken.pairs.clone(),
+                        futures_pairs: cfg.kraken.futures_pairs.clone(),
+                        futures_poll_secs: cfg.kraken.futures_poll_secs,
                     },
-                    tradable.clone(),
                     price_tx.clone(),
-                    event_tx.clone(),
                     shutdown.clone(),
                 );
-                fee_recipient_cache = Some(handles.fee_recipient);
                 // Represented as one task for the shutdown-select below,
                 // same shape as the mock replay task.
                 Some(tokio::spawn(async move {
-                    for task in handles.tasks {
-                        let _ = task.await;
+                    for handle in handles {
+                        let _ = handle.await;
                     }
                 }))
             }
@@ -214,9 +205,15 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     };
 
     // --- Strategy task: price ticks in, signals out ---
-    let mut strategy =
-        strategies::build_strategy(&cfg.general.strategy, &cfg.strategy.momentum, &cfg.strategy.grid)
-            .with_context(|| format!("unknown strategy {:?}", cfg.general.strategy))?;
+    let mut strategy = strategies::build_strategy(
+        &cfg.general.strategy,
+        &cfg.strategy.momentum,
+        &cfg.strategy.grid,
+        &cfg.strategy.market_maker,
+        &cfg.strategy.triangular_arbitrage,
+        &cfg.strategy.funding_carry,
+    )
+    .with_context(|| format!("unknown strategy {:?}", cfg.general.strategy))?;
     let strategy_task = {
         let mut price_rx = price_tx.subscribe();
         let sig_tx = sig_tx.clone();
@@ -247,39 +244,30 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let sd = shutdown.clone();
         let mut sig_rx = sig_rx;
         let executor = execution::Executor::new(dry_run);
-        let mut risk_mgr = RiskManager::new(risk_cfg, tiers, cfg.execution.slippage_bps, starting_capital_sol);
+        let mut risk_mgr = RiskManager::new(risk_cfg, tiers, cfg.execution.slippage_bps, starting_capital_quote);
         let storage = storage.clone();
-        let wallet_keypair = wallet_keypair;
         let snapshot_tx = snapshot_tx;
-        let tradable = tradable.clone();
-        let fee_recipient_cache = fee_recipient_cache.clone();
+        let pair_metas = pair_metas.clone();
+        let spot_creds = spot_creds;
+        let futures_creds = futures_creds;
 
         tokio::spawn(async move {
             let ctx = OrderContext {
                 executor: &executor,
                 storage: &storage,
                 event_tx: &event_tx,
-                wallet: wallet_keypair.as_ref(),
-                fee_recipient: fee_recipient_cache.as_ref(),
+                spot_credentials: spot_creds.as_ref().map(|c| (c.api_key.as_str(), c.api_secret.as_str())),
+                futures_credentials: futures_creds.as_ref().map(|c| (c.api_key.as_str(), c.api_secret.as_str())),
             };
-            let mut last_price: HashMap<Pubkey, f64> = HashMap::new();
+            let mut last_price: HashMap<Pair, f64> = HashMap::new();
             loop {
                 tokio::select! {
                     _ = sd.cancelled() => break,
                     tick = price_rx.recv() => match tick {
                         Ok(tick) => {
-                            last_price.insert(tick.mint, tick.price);
+                            last_price.insert(tick.pair.clone(), tick.price);
                             for order in risk_mgr.on_price_tick(&tick) {
-                                match tradable.read().await.get(&order.mint).cloned() {
-                                    Some(state) => handle_order(&ctx, &mut risk_mgr, order, tick.price, &state).await,
-                                    None => {
-                                        tracing::error!(mint = %order.mint, "no known token state for a protective-exit order; dropping");
-                                        let _ = event_tx.send(AppEvent::OrderRejected {
-                                            mint: order.mint,
-                                            reason: "no known token state".to_string(),
-                                        });
-                                    }
-                                }
+                                handle_order(&ctx, &mut risk_mgr, order).await;
                             }
                             for ev in risk_mgr.drain_events() {
                                 let _ = event_tx.send(ev);
@@ -290,22 +278,22 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     },
                     signal = sig_rx.recv() => match signal {
                         Some(signal) => {
-                            let mark_price = last_price.get(&signal.mint).copied().unwrap_or(0.0);
-                            match tradable.read().await.get(&signal.mint).cloned() {
-                                Some(state) => {
-                                    let decision = risk_mgr.evaluate_signal(&signal, &state.meta, mark_price);
+                            let mark_price = last_price.get(&signal.pair).copied().unwrap_or(0.0);
+                            match pair_metas.get(&signal.pair) {
+                                Some(pair_meta) => {
+                                    let decision = risk_mgr.evaluate_signal(&signal, pair_meta, mark_price);
                                     match decision {
                                         RiskDecision::Approved(order) => {
-                                            handle_order(&ctx, &mut risk_mgr, order, mark_price, &state).await;
+                                            handle_order(&ctx, &mut risk_mgr, order).await;
                                         }
                                         RiskDecision::Rejected(reason) => {
-                                            tracing::debug!(mint = %signal.mint, reason, "signal rejected by risk manager");
-                                            let _ = event_tx.send(AppEvent::OrderRejected { mint: signal.mint, reason });
+                                            tracing::debug!(pair = %signal.pair, reason, "signal rejected by risk manager");
+                                            let _ = event_tx.send(AppEvent::OrderRejected { pair: signal.pair.clone(), reason });
                                         }
                                     }
                                 }
                                 None => {
-                                    tracing::debug!(mint = %signal.mint, "signal for a mint with no known token state; dropping");
+                                    tracing::debug!(pair = %signal.pair, "signal for a pair with no configured PairMeta; dropping");
                                 }
                             }
                         }
@@ -313,10 +301,11 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                     }
                 }
                 let _ = snapshot_tx.send(bot_core::Snapshot {
-                    equity_sol: risk_mgr.equity_sol(),
-                    realized_pnl_sol: risk_mgr.realized_pnl_sol(),
-                    unrealized_pnl_sol: risk_mgr.total_unrealized_pnl_sol(),
-                    daily_pnl_sol: risk_mgr.daily_pnl_sol(),
+                    equity_quote: risk_mgr.equity_quote(),
+                    realized_pnl_quote: risk_mgr.realized_pnl_quote(),
+                    unrealized_pnl_quote: risk_mgr.total_unrealized_pnl_quote(),
+                    daily_pnl_quote: risk_mgr.daily_pnl_quote(),
+                    daily_funding_quote: risk_mgr.daily_funding_quote(),
                     open_positions: risk_mgr.open_position_count(),
                     circuit_breaker_tripped: risk_mgr.is_breaker_tripped(),
                 });
@@ -326,7 +315,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     // --- Event logger: everything on the bus gets logged + persisted ---
     // Deliberately does NOT select on the shutdown token: a Fill produced
-    // right as shutdown begins (e.g. still waiting on a slow Jupiter quote)
+    // right as shutdown begins (e.g. still waiting on a slow Kraken call)
     // must still get logged/persisted, not dropped because the logger won
     // a race against its own cancellation. It exits only once every
     // `event_tx` sender is gone (see the shutdown sequence below), which
@@ -430,7 +419,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
 
     shutdown.cancel();
     // Let the producer tasks finish whatever they're mid-await on (e.g. a
-    // Jupiter quote in flight) before touching the event bus, so nothing
+    // Kraken call in flight) before touching the event bus, so nothing
     // they send gets lost.
     let _ = tokio::time::timeout(Duration::from_secs(10), async {
         let _ = strategy_task.await;
@@ -454,61 +443,44 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn fetch_live_balance_sol(wallet: &Keypair) -> anyhow::Result<f64> {
-    let rpc_url = std::env::var("ALCHEMY_RPC_URL").context("ALCHEMY_RPC_URL not set in .env")?;
-    let rpc = solana_client::nonblocking::rpc_client::RpcClient::new(rpc_url);
-    let lamports = rpc.get_balance(&wallet.pubkey()).await.context("get_balance failed")?;
-    Ok(lamports as f64 / 1_000_000_000.0)
+/// Best-effort lookup of `base_currency`'s balance out of Kraken's
+/// `Balance` response. Kraken's classic asset codes commonly prefix fiat
+/// with `Z` and crypto with `X` (e.g. `USD` -> `ZUSD`, `XBT` -> `XXBT`) -
+/// this tries the bare code and both prefixed forms, but it is a real,
+/// documented heuristic, not a full asset-code table (see README).
+async fn fetch_live_balance_quote(api_key: &str, api_secret: &str, base_currency: &str) -> anyhow::Result<f64> {
+    let client = execution::KrakenSpotClient::new();
+    let balances = client.balance(api_key, api_secret).await.context("Balance call failed")?;
+    let candidates = [base_currency.to_string(), format!("Z{base_currency}"), format!("X{base_currency}")];
+    for key in &candidates {
+        if let Some(raw) = balances.get(key) {
+            if let Ok(value) = raw.parse::<f64>() {
+                return Ok(value);
+            }
+        }
+    }
+    anyhow::bail!("no balance entry found for {base_currency} in Kraken's Balance response (tried {candidates:?})")
 }
 
-/// Bundles the pieces `handle_order` needs beyond the order itself and the
-/// current mark price - the task-local dependencies that don't change
-/// between calls within one risk/execution task. `fee_recipient` is only
-/// `Some` in live mode (see `live_pipeline`); mock mode never trades a
-/// bonding-curve-phase token so it never needs one.
+/// Bundles the pieces `handle_order` needs beyond the order itself - the
+/// task-local dependencies that don't change between calls within one
+/// risk/execution task. `spot_credentials`/`futures_credentials` are only
+/// `Some` in live mode.
 #[derive(Clone, Copy)]
 struct OrderContext<'a> {
     executor: &'a execution::Executor,
     storage: &'a storage::StorageHandle,
     event_tx: &'a broadcast::Sender<AppEvent>,
-    wallet: Option<&'a Keypair>,
-    fee_recipient: Option<&'a live_pipeline::FeeRecipientCache>,
+    spot_credentials: Option<(&'a str, &'a str)>,
+    futures_credentials: Option<(&'a str, &'a str)>,
 }
 
-async fn handle_order(
-    ctx: &OrderContext<'_>,
-    risk_mgr: &mut RiskManager,
-    order: bot_core::ApprovedOrder,
-    mark_price: f64,
-    state: &live_pipeline::LiveTokenState,
-) {
-    let OrderContext { executor, storage, event_tx, wallet, fee_recipient } = *ctx;
-
-    // A bonding-curve order needs a fresh curve reading (cached from the
-    // last account update - see live_pipeline::CachedCurveState), the
-    // mint's owning token program, and the live fee_recipient. Any of these
-    // being unavailable means the executor cleanly refuses rather than
-    // guessing - see `execution::Executor::execute_bonding_curve`.
-    let bonding_curve_ctx = if order.token_meta.phase == TokenPhase::BondingCurve {
-        let fee_recipient = fee_recipient.and_then(|cache| *cache.lock().expect("fee_recipient cache mutex poisoned"));
-        match (state.curve, state.token_program, fee_recipient) {
-            (Some(curve), Some(token_program), Some(fee_recipient)) => Some(execution::BondingCurveContext {
-                virtual_token_reserves: curve.virtual_token_reserves,
-                virtual_sol_reserves: curve.virtual_sol_reserves,
-                creator: curve.creator,
-                fee_recipient,
-                token_program,
-            }),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    match executor.execute(&order, mark_price, state.decimals, wallet, bonding_curve_ctx).await {
+async fn handle_order(ctx: &OrderContext<'_>, risk_mgr: &mut RiskManager, order: bot_core::ApprovedOrder) {
+    let OrderContext { executor, storage, event_tx, spot_credentials, futures_credentials } = *ctx;
+    match executor.execute(&order, spot_credentials, futures_credentials).await {
         Ok(fill) => {
             tracing::info!(
-                mint = %fill.mint, side = ?fill.side, qty = fill.qty, price = fill.price,
+                pair = %fill.pair, side = ?fill.side, qty = fill.qty, price = fill.price,
                 dry_run = fill.dry_run, "fill"
             );
             risk_mgr.on_fill(&fill);
@@ -518,8 +490,8 @@ async fn handle_order(
             let _ = event_tx.send(AppEvent::Fill(fill));
         }
         Err(e) => {
-            tracing::error!(mint = %order.mint, side = ?order.side, "order execution failed: {e}");
-            let _ = event_tx.send(AppEvent::OrderRejected { mint: order.mint, reason: e.to_string() });
+            tracing::error!(pair = %order.pair, side = ?order.side, "order execution failed: {e}");
+            let _ = event_tx.send(AppEvent::OrderRejected { pair: order.pair.clone(), reason: e.to_string() });
         }
     }
 }
@@ -531,21 +503,15 @@ async fn log_event(storage: &storage::StorageHandle, event: &AppEvent) {
             LogLevel::Info,
             "fill",
             format!(
-                "{:?} {:.6} {} @ {:.8} SOL{}",
-                fill.side, fill.qty, fill.mint, fill.price, if fill.dry_run { " [DRY-RUN]" } else { "" }
+                "{:?} {:.6} {} @ {:.8}{}",
+                fill.side, fill.qty, fill.pair, fill.price, if fill.dry_run { " [DRY-RUN]" } else { "" }
             ),
         ),
-        AppEvent::OrderRejected { mint, reason } => (LogLevel::Warn, "order_rejected", format!("{mint}: {reason}")),
+        AppEvent::OrderRejected { pair, reason } => (LogLevel::Warn, "order_rejected", format!("{pair}: {reason}")),
         AppEvent::CircuitBreakerTripped { reason, .. } => {
             (LogLevel::Error, "circuit_breaker", format!("TRIPPED: {reason}"))
         }
         AppEvent::CircuitBreakerReset { .. } => (LogLevel::Info, "circuit_breaker", "reset".to_string()),
-        AppEvent::TokenDiscovered(meta) => {
-            (LogLevel::Info, "discovery", format!("discovered {} ({:?})", meta.mint, meta.phase))
-        }
-        AppEvent::TokenRejectedBySafety { mint, reasons } => {
-            (LogLevel::Warn, "safety_rejected", format!("{mint}: {}", reasons.join("; ")))
-        }
         AppEvent::Log { level, message, .. } => (*level, "log", message.clone()),
     };
     match level {

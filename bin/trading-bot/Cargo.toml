@@ -18,6 +18,7 @@ market-data = { path = "../../crates/market_data" }
 execution = { path = "../../crates/execution" }
 storage = { path = "../../crates/storage" }
 tui = { path = "../../crates/tui" }
+backtester = { path = "../../crates/backtester" }
 
 tokio.workspace = true
 tokio-util.workspace = true

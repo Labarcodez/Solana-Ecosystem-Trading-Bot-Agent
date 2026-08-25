@@ -2278,6 +2278,7 @@ name = "trading-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "backtester",
  "bot-core",
  "chrono",
  "clap",

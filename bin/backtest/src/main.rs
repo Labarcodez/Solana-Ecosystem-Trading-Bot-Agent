@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use bot_core::TrustTier;
+use bot_core::RiskTier;
 use clap::Parser;
 use risk::{RiskConfig, TierConfig};
 use serde::Deserialize;
-use strategies::{GridConfig, MomentumConfig};
+use strategies::{FundingCarryConfig, GridConfig, MarketMakerConfig, MomentumConfig, TriangularArbitrageConfig};
 
 #[derive(Parser)]
 #[command(name = "backtest", about = "Replay historical price data through a trading strategy")]
@@ -45,14 +45,17 @@ struct GeneralSection {
 struct StrategySection {
     momentum: MomentumConfig,
     grid: GridConfig,
+    market_maker: MarketMakerConfig,
+    triangular_arbitrage: TriangularArbitrageConfig,
+    funding_carry: FundingCarryConfig,
 }
 
 /// Mirrors `[risk]` including its nested `[risk.tiers.*]` sub-tables. Split
-/// into `RiskConfig` + a `TrustTier`-keyed tier map by [`into_parts`].
+/// into `RiskConfig` + a `RiskTier`-keyed tier map by [`into_parts`].
 #[derive(Debug, Clone, Deserialize)]
 struct RiskSection {
     max_open_positions: usize,
-    daily_loss_limit_sol: f64,
+    daily_loss_limit_quote: f64,
     daily_loss_limit_pct: f64,
     default_stop_loss_pct: f64,
     default_take_profit_pct: f64,
@@ -60,10 +63,10 @@ struct RiskSection {
 }
 
 impl RiskSection {
-    fn into_parts(self) -> (RiskConfig, HashMap<TrustTier, TierConfig>) {
+    fn into_parts(self) -> (RiskConfig, HashMap<RiskTier, TierConfig>) {
         let risk_cfg = RiskConfig {
             max_open_positions: self.max_open_positions,
-            daily_loss_limit_sol: self.daily_loss_limit_sol,
+            daily_loss_limit_quote: self.daily_loss_limit_quote,
             daily_loss_limit_pct: self.daily_loss_limit_pct,
             default_stop_loss_pct: self.default_stop_loss_pct,
             default_take_profit_pct: self.default_take_profit_pct,
@@ -71,9 +74,9 @@ impl RiskSection {
         let mut tiers = HashMap::new();
         for (name, cfg) in self.tiers {
             let tier = match name.as_str() {
-                "bonding_curve" => TrustTier::BondingCurve,
-                "migrated_new" => TrustTier::MigratedNew,
-                "established" => TrustTier::Established,
+                "spot" => RiskTier::Spot,
+                "margin" => RiskTier::Margin,
+                "futures" => RiskTier::Futures,
                 other => {
                     eprintln!("warning: ignoring unknown [risk.tiers.{other}] section in config");
                     continue;
@@ -107,7 +110,7 @@ fn main() -> anyhow::Result<()> {
 
     if tiers.is_empty() {
         anyhow::bail!(
-            "no valid [risk.tiers.*] sections found in {} - expected bonding_curve, migrated_new, established",
+            "no valid [risk.tiers.*] sections found in {} - expected spot, margin, futures",
             cli.config.display()
         );
     }
@@ -116,6 +119,9 @@ fn main() -> anyhow::Result<()> {
         strategy_name: &strategy_name,
         momentum: &root.strategy.momentum,
         grid: &root.strategy.grid,
+        market_maker: &root.strategy.market_maker,
+        triangular_arbitrage: &root.strategy.triangular_arbitrage,
+        funding_carry: &root.strategy.funding_carry,
         risk: &risk_cfg,
         tiers: &tiers,
         backtest: &root.backtest,

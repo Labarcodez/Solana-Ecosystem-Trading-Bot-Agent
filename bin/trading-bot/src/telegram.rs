@@ -53,16 +53,16 @@ fn non_empty_env(key: &str) -> Option<String> {
 
 /// Which `AppEvent`s become a Telegram message, and how they're worded.
 /// Deliberately selective: fills, circuit-breaker state changes, and
-/// errors are alert-worthy; routine rejections and discovery sightings
-/// would be noise at any real trading frequency, so they're skipped here
-/// (they're still fully logged/persisted - this only gates the *alert*).
+/// errors are alert-worthy; routine rejections would be noise at any real
+/// trading frequency, so they're skipped here (they're still fully
+/// logged/persisted - this only gates the *alert*).
 pub fn format_event(event: &AppEvent) -> Option<String> {
     match event {
         AppEvent::Fill(fill) => Some(format!(
-            "\u{1F4B0} <b>Fill</b> {:?} {:.4} {} @ {:.6} SOL{}",
+            "\u{1F4B0} <b>Fill</b> {:?} {:.4} {} @ {:.6}{}",
             fill.side,
             fill.qty,
-            fill.mint,
+            fill.pair,
             fill.price,
             if fill.dry_run { " [DRY-RUN]" } else { "" }
         )),
@@ -71,24 +71,21 @@ pub fn format_event(event: &AppEvent) -> Option<String> {
         }
         AppEvent::CircuitBreakerReset { .. } => Some("\u{2705} Circuit breaker reset".to_string()),
         AppEvent::Log { level: LogLevel::Error, message, .. } => Some(format!("\u{26A0}\u{FE0F} {message}")),
-        AppEvent::OrderRejected { .. }
-        | AppEvent::TokenDiscovered(_)
-        | AppEvent::TokenRejectedBySafety { .. }
-        | AppEvent::Log { .. } => None,
+        AppEvent::OrderRejected { .. } | AppEvent::Log { .. } => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bot_core::{OrderReason, Pubkey, Side};
+    use bot_core::{MarketType, OrderReason, Pair, Side};
 
     #[test]
     fn fill_is_formatted_with_side_and_price() {
         let fill = bot_core::Fill {
-            mint: Pubkey::new_unique(), side: Side::Buy, qty: 5.0, price: 1.23, sol_amount: 6.15,
-            fee_sol: 0.0, jito_tip_sol: 0.0, slippage_bps: None, strategy: "momentum".into(),
-            reason: OrderReason::Strategy, tx_signature: None, bundle_id: None, dry_run: true, ts: 0,
+            pair: Pair::from("XBT/USD"), side: Side::Buy, qty: 5.0, price: 1.23, quote_amount: 6.15,
+            fee_quote: 0.0, funding_paid_quote: 0.0, slippage_bps: None, market_type: MarketType::Spot,
+            strategy: "momentum".into(), reason: OrderReason::Strategy, order_id: None, dry_run: true, ts: 0,
         };
         let msg = format_event(&AppEvent::Fill(fill)).unwrap();
         assert!(msg.contains("Buy"));
@@ -113,14 +110,9 @@ mod tests {
     }
 
     #[test]
-    fn routine_rejections_and_discovery_are_not_alerted() {
-        assert!(format_event(&AppEvent::OrderRejected { mint: Pubkey::new_unique(), reason: "no capital".into() })
+    fn routine_rejections_are_not_alerted() {
+        assert!(format_event(&AppEvent::OrderRejected { pair: Pair::from("XBT/USD"), reason: "no capital".into() })
             .is_none());
-        assert!(format_event(&AppEvent::TokenRejectedBySafety {
-            mint: Pubkey::new_unique(),
-            reasons: vec!["low liquidity".into()]
-        })
-        .is_none());
     }
 
     #[test]

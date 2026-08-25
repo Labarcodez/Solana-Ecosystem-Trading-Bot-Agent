@@ -61,6 +61,7 @@ pub enum Side {
 /// and what `risk` uses to pick a tier - the direct replacement for the old
 /// Solana build's `TokenPhase` (bonding_curve/migrated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MarketType {
     /// Plain spot, no leverage.
     #[default]
