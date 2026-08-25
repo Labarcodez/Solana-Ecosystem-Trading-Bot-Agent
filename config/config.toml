@@ -3,12 +3,13 @@
 # meant to tune.
 
 [general]
-# "dry_run": full pipeline runs, real quotes are fetched, but no swap/bundle/
-#            buy-sell is ever submitted on-chain. Recommended default.
-# "live":    real trades are submitted. Requires WALLET_KEY_PATH to be unlocked.
+# "dry_run": full pipeline runs, real Kraken ticker calls are made, but no
+#            order is ever placed. Recommended default.
+# "live":    real orders are submitted. Requires credentials to be unlocked
+#            (see `trading-bot credentials init`).
 mode = "dry_run"
-strategy = "momentum"          # "momentum" | "grid"
-base_currency = "SOL"
+strategy = "momentum"          # "momentum" | "grid" | "market_maker" | "triangular_arbitrage" | "funding_carry"
+base_currency = "USD"          # used to look up your balance in live mode
 
 [strategy.momentum]
 short_window = 9
@@ -21,62 +22,90 @@ base_price = 0.0                # 0.0 = use first observed tick as base
 grid_step_pct = 2.0
 grid_levels = 5
 
+# Quotes both sides of the spread via post-only maker orders (see
+# execution::Executor's order-type policy) - buys low, sells once
+# target_spread_pct is captured. The concrete "post-only saves money"
+# mechanism described in the README.
+[strategy.market_maker]
+target_spread_pct = 0.3
+signal_strength = 0.5
+requote_cooldown_secs = 5
+
+# Compares pair_c's actual price against the rate implied by pair_a/pair_b
+# (implied = pair_b / pair_a) and trades pair_c when it's mispriced beyond
+# min_mispricing_pct. Single-leg relative-value signal, not atomic 3-leg
+# arbitrage - see strategies::triangular_arbitrage module docs.
+[strategy.triangular_arbitrage]
+pair_a = "XBT/USD"
+pair_b = "ETH/USD"
+pair_c = "ETH/XBT"
+min_mispricing_pct = 0.5
+signal_strength = 0.5
+
+# Goes long a Kraken Futures perpetual when its funding rate favors longs,
+# exits when it flips. Only meaningful if [kraken].futures_pairs includes
+# this pair - see strategies::funding_carry module docs for the honest
+# "directional tilt, not hedged carry trade" scope note.
+[strategy.funding_carry]
+pair = "PI_XBTUSD"
+min_funding_rate_pct = 0.01
+signal_strength = 0.4
+
 [risk]
 max_open_positions = 5
-daily_loss_limit_sol = 0.5
+daily_loss_limit_quote = 500.0
 daily_loss_limit_pct = 10.0
 default_stop_loss_pct = 8.0
 default_take_profit_pct = 15.0
 
-# Per-trust-tier overrides. A token's TrustTier (assigned by the `safety` and
-# `discovery` crates) selects which row applies - the bot is automatically
-# more conservative with tokens it knows less about. See README for the
-# rule-based v1 mechanism and why full ML scoring is future work, not this
-# build.
-[risk.tiers.bonding_curve]
-max_position_sol = 0.05
-risk_pct_of_capital = 1.0
-mandatory_stop_loss_pct = 15.0
-allow_take_profit_override = false
-
-[risk.tiers.migrated_new]
-max_position_sol = 0.15
-risk_pct_of_capital = 2.0
-mandatory_stop_loss_pct = 12.0
-allow_take_profit_override = true
-
-[risk.tiers.established]
-max_position_sol = 0.5
+# Per-risk-tier overrides. A position's RiskTier (spot/margin/futures, from
+# MarketType) selects which row applies - the bot is automatically more
+# conservative the more leverage a position can carry. See README for the
+# liquidation-distance-guard mechanism and the honesty note on the
+# simplified liquidation-price model.
+[risk.tiers.spot]
+max_position_quote = 500.0
 risk_pct_of_capital = 5.0
 mandatory_stop_loss_pct = 0.0   # 0 = use default_stop_loss_pct above
 allow_take_profit_override = true
+max_leverage = 1.0
+min_liquidation_distance_pct = 0.0   # not applicable - spot can't be liquidated
 
-[discovery]
-enabled = true
-watch_pumpfun_bonding_curve = true
-watch_pumpswap = true
-watch_raydium = true
-watch_orca = false
+[risk.tiers.margin]
+max_position_quote = 150.0
+risk_pct_of_capital = 2.0
+mandatory_stop_loss_pct = 10.0
+allow_take_profit_override = true
+max_leverage = 3.0
+min_liquidation_distance_pct = 20.0
 
-[safety]
-# Hard checks: failing any of these rejects the token outright.
-require_mint_authority_revoked = true
-require_freeze_authority_revoked = true
-require_lp_burned_or_locked = true
+[risk.tiers.futures]
+max_position_quote = 100.0
+risk_pct_of_capital = 1.0
+mandatory_stop_loss_pct = 8.0
+allow_take_profit_override = false
+max_leverage = 2.0
+min_liquidation_distance_pct = 30.0
 
-# Soft checks: combine into a token's trust-tier hint rather than a hard reject.
-min_liquidity_sol = 5.0
-max_holder_concentration_pct = 40.0
-min_pool_age_secs = 60
+# The static, config-driven tradable set - no discovery/safety pipeline in
+# this build (see README: Kraken lists new assets rarely and already vets
+# them, so a pump.fun-style discovery watcher has little payoff here).
+[kraken]
+pairs = ["XBT/USD"]             # Spot/Margin pairs to stream live prices for
+market_type = "spot"            # "spot" | "margin" - which product `pairs` trade as
+leverage = 2.0                  # only used if market_type = "margin" (or by futures_pairs below)
+futures_pairs = []               # Kraken Futures perpetual symbols, e.g. ["PI_XBTUSD"]
+futures_poll_secs = 30           # how often to poll Futures tickers (funding rate)
 
 [execution]
-slippage_bps = 100              # 1%
-priority_fee_lamports = 20000
-jito_tip_lamports = 10000
+slippage_bps = 100              # 1% - only applied to taker (protective-exit) fills
 
 [backtest]
-data_file = "data/sample_sol_usdc.csv"
+data_file = "data/sample_xbtusd.csv"
 slippage_bps = 50
-fee_bps = 30
-starting_capital_sol = 10.0
-jito_tip_lamports = 10000
+maker_fee_bps = 25              # Kraken base-tier maker fee (0.25%)
+taker_fee_bps = 40              # Kraken base-tier taker fee (0.40%)
+starting_capital_quote = 100000.0
+margin_interest_bps_per_day = 0  # set > 0 to model financing cost for a leveraged backtest
+market_type = "spot"
+leverage = 1.0

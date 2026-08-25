@@ -150,6 +150,23 @@ impl Default for KrakenSpotClient {
     }
 }
 
+/// Kraken's classic REST API expects pair symbols without the `/`
+/// separator (e.g. `"XBTUSD"`) - confirmed live against the public
+/// `Ticker` endpoint this session (`.../Ticker?pair=XBT/USD` returns
+/// `EQuery:Unknown asset pair`; `.../Ticker?pair=XBTUSD` succeeds). The
+/// newer WebSocket v2 API uses the slash-separated "wsname" form instead
+/// (e.g. `"XBT/USD"`, per its own docs - see `market_data::kraken_ws`).
+/// This bot's `Pair` type carries the wsname spelling end-to-end (so the
+/// same value can subscribe to live prices directly), so the REST client
+/// strips the slash at its own boundary rather than making every caller
+/// carry two spellings. Verified live for `XBT/USD` this session; not
+/// independently verified for every pair Kraken lists - if a configured
+/// pair doesn't resolve this way, `Ticker`/`AddOrder` will return a clear
+/// `EQuery:Unknown asset pair` error rather than silently misbehaving.
+fn rest_pair_symbol(pair: &str) -> String {
+    pair.replace('/', "")
+}
+
 impl KrakenSpotClient {
     pub fn new() -> Self {
         Self::with_base_url(DEFAULT_BASE_URL)
@@ -163,9 +180,10 @@ impl KrakenSpotClient {
     /// live connectivity, the same role Jupiter's `/quote` call played in
     /// the Solana build.
     pub async fn ticker(&self, pair: &str) -> Result<TickerInfo, ExecutionError> {
+        let rest_pair = rest_pair_symbol(pair);
         let url = format!("{}/0/public/Ticker", self.base_url);
         let resp: KrakenResponse<HashMap<String, TickerInfo>> =
-            self.http.get(&url).query(&[("pair", pair)]).send().await?.json().await?;
+            self.http.get(&url).query(&[("pair", &rest_pair)]).send().await?.json().await?;
         let result = unwrap_result(resp)?;
         result.into_iter().next().map(|(_, info)| info).ok_or_else(|| ExecutionError::NoTickerData(pair.to_string()))
     }
@@ -184,7 +202,7 @@ impl KrakenSpotClient {
 
         let mut form: Vec<(String, String)> = vec![
             ("nonce".into(), nonce.to_string()),
-            ("pair".into(), req.pair.to_string()),
+            ("pair".into(), rest_pair_symbol(req.pair)),
             ("type".into(), req.side.to_string()),
             ("ordertype".into(), if req.order_type == OrderType::Market { "market".into() } else { "limit".into() }),
             ("volume".into(), format!("{:.10}", req.volume)),
@@ -319,5 +337,16 @@ mod tests {
         let resp: KrakenResponse<HashMap<String, TickerInfo>> = serde_json::from_str(json).unwrap();
         let result = unwrap_result(resp);
         assert!(matches!(result, Err(ExecutionError::KrakenSpot(_))));
+    }
+
+    /// Live-verified this session: Kraken's classic REST API rejects the
+    /// slash-separated "wsname" form (`EQuery:Unknown asset pair`) and
+    /// requires the concatenated form. `ticker()` and `add_order()` must
+    /// both convert at their own boundary - see `rest_pair_symbol` docs.
+    #[test]
+    fn rest_pair_symbol_strips_the_slash() {
+        assert_eq!(rest_pair_symbol("XBT/USD"), "XBTUSD");
+        assert_eq!(rest_pair_symbol("ETH/XBT"), "ETHXBT");
+        assert_eq!(rest_pair_symbol("XBTUSD"), "XBTUSD");
     }
 }

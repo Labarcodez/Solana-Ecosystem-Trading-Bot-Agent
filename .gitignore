@@ -4,7 +4,6 @@ Cargo.lock.bak
 # Secrets - never commit
 .env
 *.enc.json
-wallet.enc.json
 
 # Local runtime artifacts
 *.db
