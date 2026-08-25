@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use bot_core::{PriceTick, Pubkey};
+use bot_core::{Pair, PriceTick};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use crate::error::MarketDataError;
 
 pub async fn replay_csv(
     path: &Path,
-    mint: Pubkey,
+    pair: Pair,
     tx: broadcast::Sender<PriceTick>,
     tick_interval: Duration,
     shutdown: CancellationToken,
@@ -37,7 +37,7 @@ pub async fn replay_csv(
         }
         // A send error just means there are currently no subscribers -
         // harmless for a broadcast channel, keep replaying.
-        let _ = tx.send(PriceTick { mint, price, ts });
+        let _ = tx.send(PriceTick { pair: pair.clone(), price, ts });
         sent += 1;
 
         if tick_interval.is_zero() {
@@ -66,11 +66,11 @@ mod tests {
     #[tokio::test]
     async fn replays_ticks_in_timestamp_order() {
         let path = write_temp_csv("order", "timestamp,price\n200,2.0\n100,1.0\n300,3.0\n");
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let (tx, mut rx) = broadcast::channel(16);
         let shutdown = CancellationToken::new();
 
-        let sent = replay_csv(&path, mint, tx, Duration::ZERO, shutdown).await.unwrap();
+        let sent = replay_csv(&path, pair, tx, Duration::ZERO, shutdown).await.unwrap();
         assert_eq!(sent, 3);
 
         let mut ts_seen = Vec::new();
@@ -89,12 +89,12 @@ mod tests {
             content.push_str(&format!("{i},1.0\n"));
         }
         let path = write_temp_csv("shutdown", &content);
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let (tx, _rx) = broadcast::channel(2000);
         let shutdown = CancellationToken::new();
         shutdown.cancel(); // cancelled before we even start
 
-        let sent = replay_csv(&path, mint, tx, Duration::from_millis(1), shutdown).await.unwrap();
+        let sent = replay_csv(&path, pair, tx, Duration::from_millis(1), shutdown).await.unwrap();
         assert_eq!(sent, 0, "already-cancelled token should stop replay immediately");
 
         std::fs::remove_file(&path).ok();
