@@ -5,11 +5,11 @@
 
 use std::path::Path;
 
-use bot_core::{PriceTick, Pubkey};
+use bot_core::{Pair, PriceTick};
 
 use crate::error::BacktestError;
 
-pub fn load_price_csv(path: &Path, mint: Pubkey) -> Result<Vec<PriceTick>, BacktestError> {
+pub fn load_price_csv(path: &Path, pair: Pair) -> Result<Vec<PriceTick>, BacktestError> {
     let mut reader = csv::Reader::from_path(path)?;
     let mut ticks = Vec::new();
 
@@ -23,7 +23,7 @@ pub fn load_price_csv(path: &Path, mint: Pubkey) -> Result<Vec<PriceTick>, Backt
             .get(1)
             .and_then(|s| s.parse().ok())
             .ok_or_else(|| BacktestError::InvalidRow(format!("row {}: bad price", line_no + 2)))?;
-        ticks.push(PriceTick { mint, price, ts });
+        ticks.push(PriceTick { pair: pair.clone(), price, funding_rate: None, ts });
     }
 
     if ticks.is_empty() {
@@ -52,8 +52,8 @@ mod tests {
     #[test]
     fn loads_and_sorts_a_csv() {
         let path = write_temp_csv("sorts", "timestamp,price\n200,10.5\n100,10.0\n300,11.0\n");
-        let mint = Pubkey::new_unique();
-        let ticks = load_price_csv(&path, mint).unwrap();
+        let pair = Pair::from("XBT/USD");
+        let ticks = load_price_csv(&path, pair).unwrap();
         assert_eq!(ticks.len(), 3);
         assert_eq!(ticks[0].ts, 100);
         assert_eq!(ticks[1].ts, 200);
@@ -64,8 +64,8 @@ mod tests {
     #[test]
     fn rejects_empty_csv() {
         let path = write_temp_csv("empty", "timestamp,price\n");
-        let mint = Pubkey::new_unique();
-        assert!(load_price_csv(&path, mint).is_err());
+        let pair = Pair::from("XBT/USD");
+        assert!(load_price_csv(&path, pair).is_err());
         std::fs::remove_file(&path).ok();
     }
 }

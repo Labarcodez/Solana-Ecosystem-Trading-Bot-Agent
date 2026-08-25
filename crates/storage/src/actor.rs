@@ -21,7 +21,7 @@ type Reply<T> = oneshot::Sender<Result<T, StorageError>>;
 enum StorageCommand {
     InsertTrade { trade: TradeRecord, reply: Reply<i64> },
     InsertOpenPosition { position: Position, reply: Reply<i64> },
-    ClosePosition { id: i64, exit_price: f64, realized_pnl_sol: f64, closed_ts: i64, reply: Reply<()> },
+    ClosePosition { id: i64, exit_price: f64, realized_pnl_quote: f64, closed_ts: i64, reply: Reply<()> },
     OpenPositions { reply: Reply<Vec<PositionRow>> },
     InsertEquitySnapshot { snapshot: EquitySnapshotRecord, reply: Reply<()> },
     RecentEquityCurve { limit: usize, reply: Reply<Vec<EquitySnapshotRecord>> },
@@ -74,10 +74,10 @@ impl StorageHandle {
         &self,
         id: i64,
         exit_price: f64,
-        realized_pnl_sol: f64,
+        realized_pnl_quote: f64,
         closed_ts: i64,
     ) -> Result<(), StorageError> {
-        self.call(|reply| StorageCommand::ClosePosition { id, exit_price, realized_pnl_sol, closed_ts, reply })
+        self.call(|reply| StorageCommand::ClosePosition { id, exit_price, realized_pnl_quote, closed_ts, reply })
             .await
     }
 
@@ -122,8 +122,8 @@ fn run(conn: Connection, rx: std_mpsc::Receiver<StorageCommand>) {
             StorageCommand::InsertOpenPosition { position, reply } => {
                 let _ = reply.send(repo::insert_open_position(&conn, &position));
             }
-            StorageCommand::ClosePosition { id, exit_price, realized_pnl_sol, closed_ts, reply } => {
-                let _ = reply.send(repo::close_position(&conn, id, exit_price, realized_pnl_sol, closed_ts));
+            StorageCommand::ClosePosition { id, exit_price, realized_pnl_quote, closed_ts, reply } => {
+                let _ = reply.send(repo::close_position(&conn, id, exit_price, realized_pnl_quote, closed_ts));
             }
             StorageCommand::OpenPositions { reply } => {
                 let _ = reply.send(repo::open_positions(&conn));
@@ -156,12 +156,13 @@ mod tests {
     #[tokio::test]
     async fn actor_round_trips_a_trade_over_the_channel() {
         let handle = StorageHandle::spawn(":memory:").unwrap();
-        let mint = bot_core::Pubkey::new_unique();
+        let pair = bot_core::Pair::from("XBT/USD");
         let fill = Fill {
-            mint, side: Side::Buy, qty: 1.0, price: 1.0, sol_amount: 1.0,
-            fee_sol: 0.0, jito_tip_sol: 0.0, slippage_bps: None,
+            pair, side: Side::Buy, qty: 1.0, price: 1.0, quote_amount: 1.0,
+            fee_quote: 0.0, funding_paid_quote: 0.0, slippage_bps: None,
+            market_type: bot_core::MarketType::Spot,
             strategy: "test".into(), reason: OrderReason::Strategy,
-            tx_signature: None, bundle_id: None, dry_run: true, ts: 0,
+            order_id: None, dry_run: true, ts: 0,
         };
         let id = handle.insert_trade(&fill).await.unwrap();
         assert!(id > 0);

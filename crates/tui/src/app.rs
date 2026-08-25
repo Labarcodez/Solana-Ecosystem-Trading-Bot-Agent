@@ -5,14 +5,15 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use bot_core::{AppEvent, PriceTick, Pubkey, Side, Snapshot};
+use bot_core::{AppEvent, MarketType, Pair, PriceTick, Side, Snapshot};
 
 const MAX_PRICE_HISTORY: usize = 300;
 const MAX_EVENTS: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct OpenPositionView {
-    pub mint: Pubkey,
+    pub pair: Pair,
+    pub market_type: MarketType,
     pub entry_price: f64,
     pub qty: f64,
     pub strategy: String,
@@ -24,14 +25,14 @@ pub struct App {
     pub strategy: String,
     pub paused: bool,
 
-    pub last_price: HashMap<Pubkey, f64>,
-    /// Price history for the first mint seen - enough for a single-asset
-    /// dry-run/mock demo; a live multi-asset run would key this per-mint,
+    pub last_price: HashMap<Pair, f64>,
+    /// Price history for the first pair seen - enough for a single-asset
+    /// dry-run/mock demo; a live multi-pair run would key this per-pair,
     /// noted as a natural extension rather than implemented here.
-    pub primary_mint: Option<Pubkey>,
+    pub primary_pair: Option<Pair>,
     pub price_history: VecDeque<(i64, f64)>,
 
-    pub positions: HashMap<Pubkey, OpenPositionView>,
+    pub positions: HashMap<Pair, OpenPositionView>,
     pub trade_count: usize,
 
     /// Authoritative PnL/equity figures, fed from RiskManager via a
@@ -49,7 +50,7 @@ impl App {
             strategy: strategy.into(),
             paused: false,
             last_price: HashMap::new(),
-            primary_mint: None,
+            primary_pair: None,
             price_history: VecDeque::with_capacity(MAX_PRICE_HISTORY),
             positions: HashMap::new(),
             trade_count: 0,
@@ -59,11 +60,11 @@ impl App {
     }
 
     pub fn on_price_tick(&mut self, tick: &PriceTick) {
-        self.last_price.insert(tick.mint, tick.price);
-        if self.primary_mint.is_none() {
-            self.primary_mint = Some(tick.mint);
+        self.last_price.insert(tick.pair.clone(), tick.price);
+        if self.primary_pair.is_none() {
+            self.primary_pair = Some(tick.pair.clone());
         }
-        if self.primary_mint == Some(tick.mint) {
+        if self.primary_pair.as_ref() == Some(&tick.pair) {
             self.price_history.push_back((tick.ts, tick.price));
             if self.price_history.len() > MAX_PRICE_HISTORY {
                 self.price_history.pop_front();
@@ -82,9 +83,10 @@ impl App {
                 match fill.side {
                     Side::Buy => {
                         self.positions.insert(
-                            fill.mint,
+                            fill.pair.clone(),
                             OpenPositionView {
-                                mint: fill.mint,
+                                pair: fill.pair.clone(),
+                                market_type: fill.market_type,
                                 entry_price: fill.price,
                                 qty: fill.qty,
                                 strategy: fill.strategy.clone(),
@@ -93,32 +95,26 @@ impl App {
                         );
                     }
                     Side::Sell => {
-                        self.positions.remove(&fill.mint);
+                        self.positions.remove(&fill.pair);
                     }
                 }
                 self.push_event(format!(
-                    "{:?} {:.4} {} @ {:.6} SOL{}",
+                    "{:?} {:.4} {} @ {:.6}{}",
                     fill.side,
                     fill.qty,
-                    short_mint(&fill.mint),
+                    fill.pair,
                     fill.price,
                     if fill.dry_run { " [DRY-RUN]" } else { "" }
                 ));
             }
-            AppEvent::OrderRejected { mint, reason } => {
-                self.push_event(format!("rejected {}: {reason}", short_mint(mint)));
+            AppEvent::OrderRejected { pair, reason } => {
+                self.push_event(format!("rejected {pair}: {reason}"));
             }
             AppEvent::CircuitBreakerTripped { reason, .. } => {
                 self.push_event(format!("CIRCUIT BREAKER TRIPPED: {reason}"));
             }
             AppEvent::CircuitBreakerReset { .. } => {
                 self.push_event("circuit breaker reset".to_string());
-            }
-            AppEvent::TokenDiscovered(meta) => {
-                self.push_event(format!("discovered {} ({:?})", short_mint(&meta.mint), meta.phase));
-            }
-            AppEvent::TokenRejectedBySafety { mint, reasons } => {
-                self.push_event(format!("safety rejected {}: {}", short_mint(mint), reasons.join("; ")));
             }
             AppEvent::Log { message, .. } => self.push_event(message.clone()),
         }
@@ -136,55 +132,44 @@ impl App {
     }
 }
 
-pub fn short_mint(mint: &Pubkey) -> String {
-    let s = mint.to_string();
-    if s.len() > 8 {
-        format!("{}..{}", &s[..4], &s[s.len() - 4..])
-    } else {
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bot_core::{OrderReason, TokenMeta, TokenPhase, TrustTier};
+    use bot_core::OrderReason;
 
-    fn tick(mint: Pubkey, price: f64, ts: i64) -> PriceTick {
-        PriceTick { mint, price, ts }
+    fn tick(pair: Pair, price: f64, ts: i64) -> PriceTick {
+        PriceTick { pair, price, funding_rate: None, ts }
     }
 
     #[test]
-    fn tracks_price_history_for_the_primary_mint_only() {
+    fn tracks_price_history_for_the_primary_pair_only() {
         let mut app = App::new("dry_run", "momentum");
-        let mint1 = Pubkey::new_unique();
-        let mint2 = Pubkey::new_unique();
-        app.on_price_tick(&tick(mint1, 1.0, 0));
-        app.on_price_tick(&tick(mint2, 2.0, 1)); // a different mint - ignored for history
-        app.on_price_tick(&tick(mint1, 1.5, 2));
+        let pair1 = Pair::from("XBT/USD");
+        let pair2 = Pair::from("ETH/USD");
+        app.on_price_tick(&tick(pair1.clone(), 1.0, 0));
+        app.on_price_tick(&tick(pair2.clone(), 2.0, 1)); // a different pair - ignored for history
+        app.on_price_tick(&tick(pair1, 1.5, 2));
         assert_eq!(app.price_history.len(), 2);
-        assert_eq!(app.last_price.get(&mint2), Some(&2.0));
+        assert_eq!(app.last_price.get(&pair2), Some(&2.0));
     }
 
     #[test]
     fn buy_fill_opens_a_position_sell_fill_closes_it() {
         let mut app = App::new("dry_run", "momentum");
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         let buy = bot_core::Fill {
-            mint, side: Side::Buy, qty: 10.0, price: 1.0, sol_amount: 10.0,
-            fee_sol: 0.0, jito_tip_sol: 0.0, slippage_bps: None,
-            strategy: "momentum".into(), reason: OrderReason::Strategy,
-            tx_signature: None, bundle_id: None, dry_run: true, ts: 0,
+            pair: pair.clone(), side: Side::Buy, qty: 10.0, price: 1.0, quote_amount: 10.0,
+            fee_quote: 0.0, funding_paid_quote: 0.0, slippage_bps: None, market_type: MarketType::Spot,
+            strategy: "momentum".into(), reason: OrderReason::Strategy, order_id: None, dry_run: true, ts: 0,
         };
         app.on_app_event(&AppEvent::Fill(buy));
         assert_eq!(app.positions.len(), 1);
         assert_eq!(app.trade_count, 1);
 
         let sell = bot_core::Fill {
-            mint, side: Side::Sell, qty: 10.0, price: 1.2, sol_amount: 12.0,
-            fee_sol: 0.0, jito_tip_sol: 0.0, slippage_bps: None,
-            strategy: "momentum".into(), reason: OrderReason::Strategy,
-            tx_signature: None, bundle_id: None, dry_run: true, ts: 1,
+            pair: pair.clone(), side: Side::Sell, qty: 10.0, price: 1.2, quote_amount: 12.0,
+            fee_quote: 0.0, funding_paid_quote: 0.0, slippage_bps: None, market_type: MarketType::Spot,
+            strategy: "momentum".into(), reason: OrderReason::Strategy, order_id: None, dry_run: true, ts: 1,
         };
         app.on_app_event(&AppEvent::Fill(sell));
         assert!(app.positions.is_empty());
@@ -204,15 +189,16 @@ mod tests {
     fn snapshot_updates_are_authoritative_not_recomputed() {
         let mut app = App::new("dry_run", "momentum");
         let snap = Snapshot {
-            equity_sol: 42.0,
-            realized_pnl_sol: 1.5,
-            unrealized_pnl_sol: -0.5,
-            daily_pnl_sol: 1.0,
+            equity_quote: 42.0,
+            realized_pnl_quote: 1.5,
+            unrealized_pnl_quote: -0.5,
+            daily_pnl_quote: 1.0,
+            daily_funding_quote: 0.0,
             open_positions: 2,
             circuit_breaker_tripped: true,
         };
         app.on_snapshot(snap.clone());
-        assert_eq!(app.snapshot.equity_sol, 42.0);
+        assert_eq!(app.snapshot.equity_quote, 42.0);
         assert!(app.snapshot.circuit_breaker_tripped);
     }
 
@@ -231,16 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_and_safety_events_use_token_meta() {
+    fn rejected_order_events_are_logged_with_the_pair() {
         let mut app = App::new("dry_run", "momentum");
-        let meta = TokenMeta {
-            mint: Pubkey::new_unique(),
-            phase: TokenPhase::BondingCurve,
-            trust_tier: TrustTier::BondingCurve,
-            discovered_at: 0,
-            source: "pumpfun_create".into(),
-        };
-        app.on_app_event(&AppEvent::TokenDiscovered(meta));
-        assert!(app.events.back().unwrap().contains("discovered"));
+        app.on_app_event(&AppEvent::OrderRejected { pair: Pair::from("XBT/USD"), reason: "insufficient capital".into() });
+        assert!(app.events.back().unwrap().contains("XBT/USD"));
     }
 }

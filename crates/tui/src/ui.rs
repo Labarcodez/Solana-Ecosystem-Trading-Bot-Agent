@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::app::{short_mint, App};
+use crate::app::App;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let root = Layout::default()
@@ -41,17 +41,22 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     };
     let paused = if app.paused { " | PAUSED" } else { "" };
 
+    // Breaker status is the most safety-critical piece of information here,
+    // so it's placed right after the mode - never at risk of being clipped
+    // off in a narrow terminal the way a trailing span could be.
     let line = Line::from(vec![
         Span::styled(format!(" {} ", app.mode.to_uppercase()), Style::default().fg(Color::Yellow)),
         Span::raw("| "),
-        Span::raw(format!("strategy: {} ", app.strategy)),
-        Span::raw("| "),
-        Span::raw(format!("equity: {:.4} SOL ", app.snapshot.equity_sol)),
-        Span::raw("| "),
-        Span::raw(format!("daily PnL: {:+.4} SOL ", app.snapshot.daily_pnl_sol)),
-        Span::raw("| "),
         Span::styled(format!("breaker: {breaker}"), breaker_style),
         Span::raw(paused),
+        Span::raw(" | "),
+        Span::raw(format!("strategy: {} ", app.strategy)),
+        Span::raw("| "),
+        Span::raw(format!("equity: {:.4} ", app.snapshot.equity_quote)),
+        Span::raw("| "),
+        Span::raw(format!("daily PnL: {:+.4} ", app.snapshot.daily_pnl_quote)),
+        Span::raw("| "),
+        Span::raw(format!("funding: {:+.4} ", app.snapshot.daily_funding_quote)),
     ]);
     frame.render_widget(Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" trading-bot ")), area);
 }
@@ -96,11 +101,12 @@ fn render_positions_panel(frame: &mut Frame, area: Rect, app: &App) {
         .positions
         .values()
         .map(|p| {
-            let current = app.last_price.get(&p.mint).copied().unwrap_or(p.entry_price);
+            let current = app.last_price.get(&p.pair).copied().unwrap_or(p.entry_price);
             let pnl_pct = if p.entry_price > 0.0 { (current - p.entry_price) / p.entry_price * 100.0 } else { 0.0 };
             let style = if pnl_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) };
             Row::new(vec![
-                short_mint(&p.mint),
+                p.pair.to_string(),
+                format!("{:?}", p.market_type),
                 p.strategy.clone(),
                 format!("{:.6}", p.entry_price),
                 format!("{:.4}", p.qty),
@@ -114,19 +120,20 @@ fn render_positions_panel(frame: &mut Frame, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(11),
+            Constraint::Length(9),
             Constraint::Length(10),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(9),
         ],
     )
-    .header(Row::new(vec!["mint", "strategy", "entry", "qty", "pnl%"]).style(Style::default().add_modifier(Modifier::BOLD)))
+    .header(Row::new(vec!["pair", "market", "strategy", "entry", "qty", "pnl%"]).style(Style::default().add_modifier(Modifier::BOLD)))
     .block(Block::default().borders(Borders::ALL).title(format!(" positions ({}) ", app.positions.len())));
     frame.render_widget(table, sections[0]);
 
     let summary = Paragraph::new(vec![
-        Line::from(format!("realized:   {:+.4} SOL", app.snapshot.realized_pnl_sol)),
-        Line::from(format!("unrealized: {:+.4} SOL", app.snapshot.unrealized_pnl_sol)),
+        Line::from(format!("realized:   {:+.4}", app.snapshot.realized_pnl_quote)),
+        Line::from(format!("unrealized: {:+.4}", app.snapshot.unrealized_pnl_quote)),
         Line::from(format!("trades:     {}", app.trade_count)),
     ])
     .block(Block::default().borders(Borders::ALL).title(" pnl "));
@@ -150,7 +157,7 @@ fn render_event_log(frame: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bot_core::{PriceTick, Pubkey};
+    use bot_core::{Pair, PriceTick};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -193,15 +200,15 @@ mod tests {
     #[test]
     fn renders_without_panicking_with_price_history_and_positions() {
         let mut app = App::new("dry_run", "momentum");
-        let mint = Pubkey::new_unique();
+        let pair = Pair::from("XBT/USD");
         for i in 0..50 {
-            app.on_price_tick(&PriceTick { mint, price: 1.0 + (i as f64) * 0.01, funding_rate: None, ts: i });
+            app.on_price_tick(&PriceTick { pair: pair.clone(), price: 1.0 + (i as f64) * 0.01, funding_rate: None, ts: i });
         }
         app.on_app_event(&bot_core::AppEvent::Fill(bot_core::Fill {
-            mint, side: bot_core::Side::Buy, qty: 5.0, price: 1.2, sol_amount: 6.0,
-            fee_sol: 0.0, jito_tip_sol: 0.0, slippage_bps: None,
+            pair, side: bot_core::Side::Buy, qty: 5.0, price: 1.2, quote_amount: 6.0,
+            fee_quote: 0.0, funding_paid_quote: 0.0, slippage_bps: None, market_type: bot_core::MarketType::Spot,
             strategy: "momentum".into(), reason: bot_core::OrderReason::Strategy,
-            tx_signature: None, bundle_id: None, dry_run: true, ts: 50,
+            order_id: None, dry_run: true, ts: 50,
         }));
         let text = rendered_text(&app, 120, 40);
         assert!(text.contains("momentum"));

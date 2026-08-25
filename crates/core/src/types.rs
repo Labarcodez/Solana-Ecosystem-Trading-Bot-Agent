@@ -60,9 +60,10 @@ pub enum Side {
 /// `execution` crate uses to route to the spot, margin, or futures client,
 /// and what `risk` uses to pick a tier - the direct replacement for the old
 /// Solana build's `TokenPhase` (bonding_curve/migrated).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MarketType {
     /// Plain spot, no leverage.
+    #[default]
     Spot,
     /// Spot trading on margin (Kraken's `leverage` parameter on `AddOrder`).
     Margin,

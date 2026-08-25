@@ -9,8 +9,8 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BacktestReport {
-    pub starting_equity_sol: f64,
-    pub final_equity_sol: f64,
+    pub starting_equity_quote: f64,
+    pub final_equity_quote: f64,
     pub total_return_pct: f64,
     pub max_drawdown_pct: f64,
     pub closed_trade_count: usize,
@@ -21,16 +21,20 @@ pub struct BacktestReport {
     /// figure (no risk-free rate, no annualization).
     pub sharpe_like_ratio: f64,
     pub circuit_breaker_trips: u32,
+    /// Sum of estimated margin-interest carrying cost across every closed
+    /// leveraged trade (see `engine::margin_carrying_cost`). `0.0` for a
+    /// spot-only run.
+    pub total_carrying_cost_quote: f64,
     pub equity_curve: Vec<(i64, f64)>,
 }
 
 impl BacktestReport {
-    pub fn compute(equity_curve: Vec<(i64, f64)>, trade_pnls: &[f64], circuit_breaker_trips: u32) -> Self {
-        let starting_equity_sol = equity_curve.first().map(|(_, e)| *e).unwrap_or(0.0);
-        let final_equity_sol = equity_curve.last().map(|(_, e)| *e).unwrap_or(starting_equity_sol);
+    pub fn compute(equity_curve: Vec<(i64, f64)>, trade_pnls: &[f64], circuit_breaker_trips: u32, total_carrying_cost_quote: f64) -> Self {
+        let starting_equity_quote = equity_curve.first().map(|(_, e)| *e).unwrap_or(0.0);
+        let final_equity_quote = equity_curve.last().map(|(_, e)| *e).unwrap_or(starting_equity_quote);
 
-        let total_return_pct = if starting_equity_sol > 0.0 {
-            (final_equity_sol - starting_equity_sol) / starting_equity_sol * 100.0
+        let total_return_pct = if starting_equity_quote > 0.0 {
+            (final_equity_quote - starting_equity_quote) / starting_equity_quote * 100.0
         } else {
             0.0
         };
@@ -46,28 +50,30 @@ impl BacktestReport {
         };
 
         Self {
-            starting_equity_sol,
-            final_equity_sol,
+            starting_equity_quote,
+            final_equity_quote,
             total_return_pct,
             max_drawdown_pct,
             closed_trade_count,
             win_rate_pct,
             sharpe_like_ratio,
             circuit_breaker_trips,
+            total_carrying_cost_quote,
             equity_curve,
         }
     }
 
     pub fn print_summary(&self) {
         println!("=== Backtest Report ===");
-        println!("Starting equity:      {:.6} SOL", self.starting_equity_sol);
-        println!("Final equity:         {:.6} SOL", self.final_equity_sol);
+        println!("Starting equity:      {:.6}", self.starting_equity_quote);
+        println!("Final equity:         {:.6}", self.final_equity_quote);
         println!("Total return:         {:+.2}%", self.total_return_pct);
         println!("Max drawdown:         {:.2}%", self.max_drawdown_pct);
         println!("Closed trades:        {}", self.closed_trade_count);
         println!("Win rate:             {:.2}%", self.win_rate_pct);
         println!("Sharpe-style ratio:   {:.3}", self.sharpe_like_ratio);
         println!("Circuit breaker trips:{}", self.circuit_breaker_trips);
+        println!("Margin carrying cost: {:.6}", self.total_carrying_cost_quote);
     }
 
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
@@ -127,9 +133,9 @@ mod tests {
     #[test]
     fn computes_return_and_drawdown() {
         let curve = vec![(0, 10.0), (1, 12.0), (2, 8.0), (3, 11.0)];
-        let report = BacktestReport::compute(curve, &[1.0, -0.5, 2.0], 0);
-        assert_eq!(report.starting_equity_sol, 10.0);
-        assert_eq!(report.final_equity_sol, 11.0);
+        let report = BacktestReport::compute(curve, &[1.0, -0.5, 2.0], 0, 0.0);
+        assert_eq!(report.starting_equity_quote, 10.0);
+        assert_eq!(report.final_equity_quote, 11.0);
         assert!((report.total_return_pct - 10.0).abs() < 1e-9);
         // Peak 12 -> trough 8 = 33.33% drawdown
         assert!((report.max_drawdown_pct - 33.333333).abs() < 1e-3);
@@ -140,7 +146,7 @@ mod tests {
     #[test]
     fn empty_trades_gives_zero_win_rate_not_a_panic() {
         let curve = vec![(0, 10.0), (1, 10.0)];
-        let report = BacktestReport::compute(curve, &[], 0);
+        let report = BacktestReport::compute(curve, &[], 0, 0.0);
         assert_eq!(report.win_rate_pct, 0.0);
         assert_eq!(report.closed_trade_count, 0);
     }
@@ -148,9 +154,10 @@ mod tests {
     #[test]
     fn json_serialization_round_trips_shape() {
         let curve = vec![(0, 10.0), (1, 10.5)];
-        let report = BacktestReport::compute(curve, &[0.5], 1);
+        let report = BacktestReport::compute(curve, &[0.5], 1, 0.02);
         let json = report.to_json_pretty().unwrap();
         assert!(json.contains("total_return_pct"));
         assert!(json.contains("circuit_breaker_trips"));
+        assert!(json.contains("total_carrying_cost_quote"));
     }
 }
