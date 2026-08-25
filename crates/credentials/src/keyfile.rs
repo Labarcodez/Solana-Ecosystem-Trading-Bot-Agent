@@ -1,12 +1,12 @@
-//! On-disk format for the encrypted wallet key. Pure data + file I/O - no
-//! cryptography here, that lives in `crypto.rs`.
+//! On-disk format for the encrypted Kraken credentials file. Pure data +
+//! file I/O - no cryptography here, that lives in `crypto.rs`.
 
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::WalletError;
+use crate::error::CredentialsError;
 
 pub const CURRENT_VERSION: u8 = 1;
 
@@ -41,9 +41,9 @@ pub struct KeyFile {
 }
 
 impl KeyFile {
-    pub fn save(&self, path: &Path) -> Result<(), WalletError> {
+    pub fn save(&self, path: &Path) -> Result<(), CredentialsError> {
         if path.exists() {
-            return Err(WalletError::AlreadyExists(path.display().to_string()));
+            return Err(CredentialsError::AlreadyExists(path.display().to_string()));
         }
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
@@ -51,24 +51,24 @@ impl KeyFile {
     }
 
     /// Overwrite an existing file unconditionally - used by tests and by
-    /// explicit re-key flows, never by the default `wallet init` path.
-    pub fn save_overwrite(&self, path: &Path) -> Result<(), WalletError> {
+    /// explicit re-key flows, never by the default `credentials init` path.
+    pub fn save_overwrite(&self, path: &Path) -> Result<(), CredentialsError> {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)?;
         Ok(())
     }
 
-    pub fn load(path: &Path) -> Result<Self, WalletError> {
+    pub fn load(path: &Path) -> Result<Self, CredentialsError> {
         let json = fs::read_to_string(path)?;
         let kf: KeyFile = serde_json::from_str(&json)?;
         if kf.version != CURRENT_VERSION {
-            return Err(WalletError::UnsupportedVersion(kf.version));
+            return Err(CredentialsError::UnsupportedVersion(kf.version));
         }
         if kf.kdf != "argon2id" {
-            return Err(WalletError::UnsupportedKdf(kf.kdf));
+            return Err(CredentialsError::UnsupportedKdf(kf.kdf));
         }
         if kf.cipher != "aes-256-gcm" {
-            return Err(WalletError::UnsupportedCipher(kf.cipher));
+            return Err(CredentialsError::UnsupportedCipher(kf.cipher));
         }
         Ok(kf)
     }

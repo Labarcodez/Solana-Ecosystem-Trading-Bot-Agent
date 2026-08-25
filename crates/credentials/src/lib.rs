@@ -1,95 +1,110 @@
-//! `wallet`: encrypted-at-rest Solana keypair. The private key exists in
-//! plaintext only in memory, only after the user types the correct
-//! passphrase, and only for as long as it takes to construct a
-//! `solana_sdk::signature::Keypair` from it - see `crypto.rs` for the
-//! Argon2id + AES-256-GCM implementation and the honest caveat about
-//! `Keypair`'s own internal storage not being zeroize-aware.
+//! `credentials`: encrypted-at-rest Kraken API key/secret pair. The
+//! plaintext credentials exist in memory only after the user types the
+//! correct passphrase, and only for as long as the process needs them - see
+//! `crypto.rs` for the Argon2id + AES-256-GCM implementation.
+//!
+//! Unlike the Solana wallet this replaces, there is no on-chain signing
+//! concept at all here: a Kraken API key/secret pair is just two opaque
+//! strings used to HMAC-sign HTTP requests (see `execution::kraken_spot`/
+//! `kraken_futures`). Both fields are held in [`zeroize::Zeroizing`]
+//! wrappers, so - unlike the old `solana_sdk::Keypair`, whose internal
+//! storage wasn't zeroize-aware - this crate can genuinely guarantee the
+//! plaintext is wiped when a `KrakenCredentials` value is dropped.
+//!
+//! Kraken recommends a separate API key for its Futures product from the
+//! one used for Spot/Margin; this crate is deliberately generic over *which*
+//! credentials it's protecting (see `bin/trading-bot`'s
+//! `KRAKEN_CREDENTIALS_PATH`/`KRAKEN_FUTURES_CREDENTIALS_PATH` env vars) -
+//! it just encrypts/decrypts one key/secret pair per file.
 
 pub mod crypto;
 pub mod error;
 pub mod keyfile;
 pub mod prompt;
 
-pub use error::WalletError;
+pub use error::CredentialsError;
 pub use keyfile::KeyFile;
 
 use std::path::Path;
 
 use secrecy::SecretString;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, Signer};
-use zeroize::Zeroize;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
-/// Generate a brand-new keypair, encrypt it under `passphrase`, and write it
-/// to `path`. Refuses to overwrite an existing file - callers wanting to
-/// re-key an existing wallet must move/delete the old file first.
-pub fn init_new(path: &Path, passphrase: &SecretString) -> Result<Pubkey, WalletError> {
-    let keypair = Keypair::new();
-    let pubkey = keypair.pubkey();
-    let mut bytes = keypair.to_bytes();
-    let kf = crypto::encrypt_keypair(passphrase, &bytes);
-    bytes.zeroize();
-    let kf = kf?;
-    kf.save(path)?;
-    Ok(pubkey)
+/// A decrypted Kraken API key/secret pair, held only as long as the caller
+/// needs it. Both fields zeroize their backing memory on drop.
+pub struct KrakenCredentials {
+    pub api_key: Zeroizing<String>,
+    pub api_secret: Zeroizing<String>,
 }
 
-/// Import an existing 64-byte Solana keypair and encrypt it under
-/// `passphrase`. Takes ownership of `keypair_bytes` and zeroizes it before
-/// returning, win or lose.
-pub fn import(path: &Path, passphrase: &SecretString, mut keypair_bytes: [u8; 64]) -> Result<Pubkey, WalletError> {
-    let result = (|| {
-        let keypair = Keypair::try_from(&keypair_bytes[..])
-            .map_err(|e| WalletError::InvalidKeypair(e.to_string()))?;
-        let pubkey = keypair.pubkey();
-        let kf = crypto::encrypt_keypair(passphrase, &keypair_bytes)?;
-        Ok::<_, WalletError>((pubkey, kf))
-    })();
-    keypair_bytes.zeroize();
-    let (pubkey, kf) = result?;
-    kf.save(path)?;
-    Ok(pubkey)
+/// The plaintext shape encrypted inside the key file - kept private and
+/// separate from `KrakenCredentials` so the wire/at-rest format doesn't
+/// need to carry the `Zeroizing` wrapper (serde doesn't need it; the
+/// deserialized `String`s are copied into `Zeroizing` fields immediately
+/// after decoding, and the intermediate JSON `String`s are dropped without
+/// a durable reference once that copy happens).
+#[derive(Serialize, Deserialize)]
+struct CredentialsPayload {
+    api_key: String,
+    api_secret: String,
 }
 
-/// Load and decrypt the wallet at `path`, returning a live `Keypair`. The
-/// intermediate decrypted byte buffer is zeroized immediately after the
-/// `Keypair` is constructed from it (see the module-level caveat about
-/// `Keypair`'s own internals).
-pub fn unlock(path: &Path, passphrase: &SecretString) -> Result<Keypair, WalletError> {
-    let kf = KeyFile::load(path)?;
-    let mut bytes = crypto::decrypt_keypair(passphrase, &kf)?;
-    if bytes.len() != 64 {
-        bytes.zeroize();
-        return Err(WalletError::BadKeyLength { expected: 64, got: bytes.len() });
+/// Encrypt `api_key`/`api_secret` under `passphrase` and write them to
+/// `path`. Refuses to overwrite an existing file - callers wanting to
+/// re-key an existing credentials file must move/delete the old file first.
+pub fn init_new(
+    path: &Path,
+    passphrase: &SecretString,
+    api_key: &str,
+    api_secret: &str,
+) -> Result<(), CredentialsError> {
+    if api_key.trim().is_empty() || api_secret.trim().is_empty() {
+        return Err(CredentialsError::EmptyCredential);
     }
-    let keypair = Keypair::try_from(bytes.as_slice()).map_err(|e| WalletError::InvalidKeypair(e.to_string()));
-    bytes.zeroize();
-    keypair
+    let payload = CredentialsPayload { api_key: api_key.to_string(), api_secret: api_secret.to_string() };
+    let json = serde_json::to_vec(&payload)?;
+    let kf = crypto::encrypt_payload(passphrase, &json)?;
+    kf.save(path)?;
+    Ok(())
 }
 
-/// Interactive `wallet init` CLI flow: prompts twice for a new passphrase
-/// (never echoed), generates a fresh keypair, and writes the encrypted key
-/// file. Returns the new wallet's public key so the caller can print it.
-pub fn init_interactive(path: &Path) -> Result<Pubkey, WalletError> {
+/// Load and decrypt the credentials at `path`.
+pub fn unlock(path: &Path, passphrase: &SecretString) -> Result<KrakenCredentials, CredentialsError> {
+    let kf = KeyFile::load(path)?;
+    let bytes = crypto::decrypt_payload(passphrase, &kf)?;
+    let payload: CredentialsPayload = serde_json::from_slice(&bytes)?;
+    Ok(KrakenCredentials {
+        api_key: Zeroizing::new(payload.api_key),
+        api_secret: Zeroizing::new(payload.api_secret),
+    })
+}
+
+/// Interactive `credentials init` CLI flow: prompts for the Kraken API key
+/// and API secret (both hidden, never echoed), then twice for a new
+/// encryption passphrase, and writes the encrypted file.
+pub fn init_interactive(path: &Path) -> Result<(), CredentialsError> {
+    let api_key = prompt::prompt_secret("Kraken API key: ")?;
+    let api_secret = prompt::prompt_secret("Kraken API secret: ")?;
     let passphrase = prompt::prompt_new_passphrase()?;
-    init_new(path, &passphrase)
+    init_new(path, &passphrase, &api_key, &api_secret)
 }
 
 /// Interactive startup flow: prompts once, with a bounded retry loop on a
-/// wrong passphrase, and returns the unlocked keypair.
-pub fn unlock_interactive(path: &Path) -> Result<Keypair, WalletError> {
+/// wrong passphrase, and returns the unlocked credentials.
+pub fn unlock_interactive(path: &Path) -> Result<KrakenCredentials, CredentialsError> {
     const MAX_ATTEMPTS: u32 = 3;
     for attempt in 1..=MAX_ATTEMPTS {
-        let passphrase = prompt::prompt_passphrase("Wallet passphrase: ")?;
+        let passphrase = prompt::prompt_passphrase("Credentials passphrase: ")?;
         match unlock(path, &passphrase) {
-            Ok(kp) => return Ok(kp),
-            Err(WalletError::DecryptionFailed) if attempt < MAX_ATTEMPTS => {
+            Ok(creds) => return Ok(creds),
+            Err(CredentialsError::DecryptionFailed) if attempt < MAX_ATTEMPTS => {
                 eprintln!("Wrong passphrase, try again ({attempt}/{MAX_ATTEMPTS}).");
             }
             Err(e) => return Err(e),
         }
     }
-    Err(WalletError::DecryptionFailed)
+    Err(CredentialsError::DecryptionFailed)
 }
 
 #[cfg(test)]
@@ -103,7 +118,7 @@ mod tests {
 
         pub fn temp_path(name: &str) -> PathBuf {
             let mut p = std::env::temp_dir();
-            p.push(format!("wallet_test_{}_{}", std::process::id(), name));
+            p.push(format!("credentials_test_{}_{}", std::process::id(), name));
             p
         }
     }
@@ -113,13 +128,14 @@ mod tests {
     }
 
     #[test]
-    fn init_new_then_unlock_round_trips_the_same_pubkey() {
+    fn init_new_then_unlock_round_trips_the_same_credentials() {
         let path = temp_path("init_unlock.enc.json");
         let _ = std::fs::remove_file(&path);
 
-        let pubkey = init_new(&path, &pass("test passphrase")).unwrap();
+        init_new(&path, &pass("test passphrase"), "my-api-key", "my-api-secret").unwrap();
         let unlocked = unlock(&path, &pass("test passphrase")).unwrap();
-        assert_eq!(unlocked.pubkey(), pubkey);
+        assert_eq!(unlocked.api_key.as_str(), "my-api-key");
+        assert_eq!(unlocked.api_secret.as_str(), "my-api-secret");
 
         std::fs::remove_file(&path).ok();
     }
@@ -129,9 +145,9 @@ mod tests {
         let path = temp_path("wrong_pass.enc.json");
         let _ = std::fs::remove_file(&path);
 
-        init_new(&path, &pass("right")).unwrap();
+        init_new(&path, &pass("right"), "key", "secret").unwrap();
         let result = unlock(&path, &pass("wrong"));
-        assert!(matches!(result, Err(WalletError::DecryptionFailed)));
+        assert!(matches!(result, Err(CredentialsError::DecryptionFailed)));
 
         std::fs::remove_file(&path).ok();
     }
@@ -141,28 +157,20 @@ mod tests {
         let path = temp_path("no_overwrite.enc.json");
         let _ = std::fs::remove_file(&path);
 
-        init_new(&path, &pass("first")).unwrap();
-        let second = init_new(&path, &pass("second"));
-        assert!(matches!(second, Err(WalletError::AlreadyExists(_))));
+        init_new(&path, &pass("first"), "key1", "secret1").unwrap();
+        let second = init_new(&path, &pass("second"), "key2", "secret2");
+        assert!(matches!(second, Err(CredentialsError::AlreadyExists(_))));
 
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn import_round_trips_a_known_keypair() {
-        let path = temp_path("import.enc.json");
+    fn init_new_rejects_an_empty_api_key_or_secret() {
+        let path = temp_path("empty_cred.enc.json");
         let _ = std::fs::remove_file(&path);
 
-        let kp = Keypair::new();
-        let expected_pubkey = kp.pubkey();
-        let bytes = kp.to_bytes();
-
-        let pubkey = import(&path, &pass("import passphrase"), bytes).unwrap();
-        assert_eq!(pubkey, expected_pubkey);
-
-        let unlocked = unlock(&path, &pass("import passphrase")).unwrap();
-        assert_eq!(unlocked.pubkey(), expected_pubkey);
-
-        std::fs::remove_file(&path).ok();
+        let result = init_new(&path, &pass("pw"), "", "secret");
+        assert!(matches!(result, Err(CredentialsError::EmptyCredential)));
+        assert!(!path.exists(), "must not write a file for a rejected credential");
     }
 }
