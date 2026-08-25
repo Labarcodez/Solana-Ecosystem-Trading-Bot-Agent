@@ -94,10 +94,12 @@ pub fn run(params: &BacktestParams) -> Result<BacktestReport, BacktestError> {
     let mut equity_curve = Vec::with_capacity(ticks.len());
     let mut trade_pnls = Vec::new();
     let mut total_carrying_cost_quote = 0.0;
-    // (entry_price, entry_ts, leverage) - leverage tracked per-position so
-    // the carrying-cost estimate at close time uses what was actually in
-    // effect when the position was opened.
-    let mut open_entry: Option<(f64, i64, f64)> = None;
+    // (entry_price, entry_ts, leverage, entry_fee_quote) - leverage tracked
+    // per-position so the carrying-cost estimate at close time uses what
+    // was actually in effect when the position was opened; entry_fee_quote
+    // so the per-trade PnL below nets out *both* legs' fees, not just the
+    // exit's (see `apply_fill`'s Sell case).
+    let mut open_entry: Option<(f64, i64, f64, f64)> = None;
     let mut breaker_trips: u32 = 0;
 
     for tick in &ticks {
@@ -139,22 +141,27 @@ fn apply_fill(
     leverage: f64,
     risk_mgr: &mut RiskManager,
     strategy: &mut dyn Strategy,
-    open_entry: &mut Option<(f64, i64, f64)>,
+    open_entry: &mut Option<(f64, i64, f64, f64)>,
     trade_pnls: &mut Vec<f64>,
     total_carrying_cost_quote: &mut f64,
     margin_interest_bps_per_day: u32,
 ) {
     match fill.side {
         Side::Buy => {
-            *open_entry = Some((fill.price, fill.ts, leverage));
+            *open_entry = Some((fill.price, fill.ts, leverage, fill.fee_quote));
         }
         Side::Sell => {
-            if let Some((entry_price, entry_ts, entry_leverage)) = open_entry.take() {
+            if let Some((entry_price, entry_ts, entry_leverage, entry_fee_quote)) = open_entry.take() {
                 let carrying_cost = margin_carrying_cost(
                     fill.qty, entry_price, entry_leverage, entry_ts, fill.ts, margin_interest_bps_per_day,
                 );
                 *total_carrying_cost_quote += carrying_cost;
-                let pnl = (fill.price - entry_price) * fill.qty - fill.fee_quote - carrying_cost;
+                // Nets out *both* legs' fees - the entry fee paid when this
+                // position was opened, not just this exit fill's own. See
+                // `risk::RiskManager::on_fill`'s equivalent fix for
+                // `capital_quote`/`equity_quote` - this is the same gap in
+                // the backtest report's separate per-trade PnL stats.
+                let pnl = (fill.price - entry_price) * fill.qty - entry_fee_quote - fill.fee_quote - carrying_cost;
                 trade_pnls.push(pnl);
             }
         }
@@ -361,5 +368,61 @@ mod tests {
         assert!(report.total_carrying_cost_quote > 0.0, "a leveraged run with closed trades should accrue carrying cost");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    struct NoopStrategy;
+    impl Strategy for NoopStrategy {
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn on_price_tick(&mut self, _tick: &bot_core::PriceTick) -> Vec<bot_core::Signal> {
+            Vec::new()
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn test_fill(side: Side, qty: f64, price: f64, fee_quote: f64, ts: i64) -> Fill {
+        Fill {
+            pair: Pair::from("BACKTEST/QUOTE"),
+            side,
+            qty,
+            price,
+            quote_amount: qty * price,
+            fee_quote,
+            funding_paid_quote: 0.0,
+            slippage_bps: None,
+            market_type: MarketType::Spot,
+            strategy: "test".into(),
+            reason: bot_core::OrderReason::Strategy,
+            order_id: None,
+            dry_run: true,
+            ts,
+        }
+    }
+
+    /// Regression test: a round trip's per-trade PnL (the backtest report's
+    /// win-rate/avg-PnL stats are built from `trade_pnls`) must net out the
+    /// *entry* fee, not just the exit fee. Before this fix, `open_entry`
+    /// only remembered `(price, ts, leverage)` and the entry fill's own
+    /// `fee_quote` was silently dropped on the floor - see the equivalent
+    /// fix in `risk::RiskManager::on_fill` for `capital_quote`.
+    #[test]
+    fn trade_pnl_nets_out_both_the_entry_and_exit_fee() {
+        let mut risk_mgr = RiskManager::new(RiskConfig::default(), default_tiers(), 50, 100_000.0);
+        let mut strategy = NoopStrategy;
+        let mut open_entry = None;
+        let mut trade_pnls = Vec::new();
+        let mut total_carrying_cost_quote = 0.0;
+
+        let buy = test_fill(Side::Buy, 1.0, 100.0, 2.0, 0);
+        apply_fill(&buy, 1.0, &mut risk_mgr, &mut strategy, &mut open_entry, &mut trade_pnls, &mut total_carrying_cost_quote, 0);
+
+        let sell = test_fill(Side::Sell, 1.0, 110.0, 3.0, 60);
+        apply_fill(&sell, 1.0, &mut risk_mgr, &mut strategy, &mut open_entry, &mut trade_pnls, &mut total_carrying_cost_quote, 0);
+
+        // Raw price PnL is (110 - 100) * 1.0 = 10.0; both fees must come
+        // out of it, leaving 10.0 - 2.0 - 3.0 = 5.0.
+        assert_eq!(trade_pnls.len(), 1);
+        assert!((trade_pnls[0] - 5.0).abs() < 1e-9, "expected 5.0, got {}", trade_pnls[0]);
     }
 }

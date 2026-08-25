@@ -220,8 +220,17 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
         let sd = shutdown.clone();
         tokio::spawn(async move {
             loop {
+                // `biased` (checked top-to-bottom, no random tie-break) so
+                // a still-buffered tick always wins over `sd.cancelled()`
+                // when both happen to be ready on the same poll - without
+                // it, tokio::select!'s default random choice between two
+                // simultaneously-ready branches means shutdown can win the
+                // coin flip and the loop exits with ticks still sitting
+                // unprocessed in the channel, silently dropping whatever
+                // signal they would have produced. Cancellation only wins
+                // once there's genuinely nothing left to drain.
                 tokio::select! {
-                    _ = sd.cancelled() => break,
+                    biased;
                     tick = price_rx.recv() => match tick {
                         Ok(tick) => {
                             for signal in strategy.on_price_tick(&tick) {
@@ -230,7 +239,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
-                    }
+                    },
+                    _ = sd.cancelled() => break,
                 }
             }
         })
@@ -260,10 +270,28 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                 futures_credentials: futures_creds.as_ref().map(|c| (c.api_key.as_str(), c.api_secret.as_str())),
             };
             let mut last_price: HashMap<Pair, f64> = HashMap::new();
+            // Once price_rx closes for good, its `.recv()` future resolves
+            // to `Err(Closed)` immediately on every poll - under `biased`
+            // ordering that would make it win every single iteration
+            // forever, busy-spinning instead of ever reaching sig_rx or
+            // cancellation. This guard removes that branch from the race
+            // entirely once it's known-closed, same idea as the original
+            // `Err(Closed) => {}` (keep looping to drain sig_rx) but
+            // without pinning the CPU to do it.
+            let mut price_closed = false;
             loop {
+                // `biased` for the same reason as `strategy_task`'s loop:
+                // without it, `sd.cancelled()` can win tokio::select!'s
+                // random tie-break against a `price_rx`/`sig_rx` branch
+                // that's *also* ready (buffered ticks/signals still
+                // waiting), silently dropping them - including, worst
+                // case, an approved buy/sell order that never gets
+                // executed because the loop exited one poll too early.
+                // Checking cancellation last means it only wins once both
+                // channels are genuinely drained.
                 tokio::select! {
-                    _ = sd.cancelled() => break,
-                    tick = price_rx.recv() => match tick {
+                    biased;
+                    tick = price_rx.recv(), if !price_closed => match tick {
                         Ok(tick) => {
                             last_price.insert(tick.pair.clone(), tick.price);
                             for order in risk_mgr.on_price_tick(&tick) {
@@ -274,7 +302,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => {}
+                        Err(broadcast::error::RecvError::Closed) => { price_closed = true; }
                     },
                     signal = sig_rx.recv() => match signal {
                         Some(signal) => {
@@ -298,7 +326,8 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
                             }
                         }
                         None => break,
-                    }
+                    },
+                    _ = sd.cancelled() => break,
                 }
                 let _ = snapshot_tx.send(bot_core::Snapshot {
                     equity_quote: risk_mgr.equity_quote(),

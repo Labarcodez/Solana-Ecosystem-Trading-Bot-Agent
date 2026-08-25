@@ -67,6 +67,14 @@ pub struct RiskManager {
     /// Futures-only: cumulative funding paid (positive) / received
     /// (negative) today - see `record_funding_payment`.
     daily_funding_quote: f64,
+    /// Entry (buy-side) trading fees paid today. Exit fees are already
+    /// folded into `daily_realized_pnl_quote` at close time (see
+    /// `on_fill`'s Sell case); entry fees are debited from `capital_quote`
+    /// immediately on fill (real cash leaves the account then), so this
+    /// exists only to let `daily_pnl_quote`/the circuit breaker see that
+    /// cost on the day it was actually paid, not just once a position
+    /// eventually closes.
+    daily_entry_fees_quote: f64,
     day: Option<NaiveDate>,
 
     open_positions: HashMap<Pair, OpenPosition>,
@@ -88,6 +96,7 @@ impl RiskManager {
             starting_daily_capital_quote: starting_capital_quote,
             daily_realized_pnl_quote: 0.0,
             daily_funding_quote: 0.0,
+            daily_entry_fees_quote: 0.0,
             day: None,
             open_positions: HashMap::new(),
             pending_buys: HashMap::new(),
@@ -113,11 +122,17 @@ impl RiskManager {
         self.open_positions.values()
     }
 
-    /// Realized + unrealized PnL, net of today's funding bleed - a
-    /// perpetual position can lose money purely to funding even with flat
-    /// price, and this is what lets the circuit breaker see that.
+    /// Realized + unrealized PnL, net of today's funding bleed and entry
+    /// fees paid today - a perpetual position can lose money purely to
+    /// funding even with flat price, and a strategy that churns entries
+    /// can lose money purely to fees even with flat price and no closes
+    /// yet; both need to be visible to the circuit breaker, not just price
+    /// PnL. Exit fees are already netted into `daily_realized_pnl_quote`
+    /// at close time (see `on_fill`'s Sell case) - see
+    /// `daily_entry_fees_quote`'s docs for why entry fees are tracked
+    /// separately instead of double-counted there too.
     pub fn daily_pnl_quote(&self) -> f64 {
-        self.daily_realized_pnl_quote + self.unrealized_pnl_quote() - self.daily_funding_quote
+        self.daily_realized_pnl_quote + self.unrealized_pnl_quote() - self.daily_funding_quote - self.daily_entry_fees_quote
     }
 
     /// Realized PnL accumulated so far today (resets on UTC day rollover).
@@ -193,6 +208,7 @@ impl RiskManager {
             self.day = Some(date);
             self.daily_realized_pnl_quote = 0.0;
             self.daily_funding_quote = 0.0;
+            self.daily_entry_fees_quote = 0.0;
             self.starting_daily_capital_quote = self.capital_quote;
             if self.breaker.is_tripped() {
                 self.breaker.reset();
@@ -377,6 +393,14 @@ impl RiskManager {
     /// tier/SL/TP decided at approval time), closes and realizes PnL on a
     /// Sell fill, and releases capital reserved at approval time.
     pub fn on_fill(&mut self, fill: &Fill) {
+        // Mirrors `record_funding_payment`'s own call to this: a fill can
+        // in principle be the very first state-mutating event of a session
+        // (before any price tick has run `maybe_roll_day` for the first
+        // time), and `self.day` starts as `None`. Without rolling here
+        // first, the *next* tick would see that same still-`None` day,
+        // treat it as day 1 rolling over, and wipe out whatever this fill
+        // just accumulated into today's realized-PnL/entry-fee totals.
+        self.maybe_roll_day(fill.ts);
         match fill.side {
             Side::Buy => {
                 let pending = self.pending_buys.remove(&fill.pair);
@@ -400,6 +424,18 @@ impl RiskManager {
                     }
                 };
                 let liquidation_price = approx_liquidation_price(fill.price, pair_meta.leverage);
+                // The entry fee is real cash leaving the account the
+                // instant this fill happens - `evaluate_buy` only reserved
+                // the notional (`size_quote`), so the fee itself was never
+                // debited anywhere until now. Without this, `capital_quote`
+                // (and therefore `equity_quote`, which the TUI/backtester
+                // report as the bot's actual account value) would silently
+                // overstate reality by the sum of every entry fee ever
+                // paid. Exit fees don't need the equivalent treatment here
+                // - the Sell case below already nets `fill.fee_quote` out
+                // of `realized` before it touches `capital_quote`.
+                self.capital_quote -= fill.fee_quote;
+                self.daily_entry_fees_quote += fill.fee_quote;
                 self.open_positions.insert(
                     fill.pair.clone(),
                     OpenPosition {
@@ -446,6 +482,14 @@ mod tests {
             pair, side, qty, price, quote_amount, fee_quote: 0.0,
             funding_paid_quote: 0.0, slippage_bps: None, market_type: MarketType::Spot,
             strategy: "test".into(), reason, order_id: None, dry_run: true, ts,
+        }
+    }
+
+    fn fill_with_fee(pair: Pair, side: Side, qty: f64, price: f64, quote_amount: f64, fee_quote: f64, ts: i64) -> Fill {
+        Fill {
+            pair, side, qty, price, quote_amount, fee_quote,
+            funding_paid_quote: 0.0, slippage_bps: None, market_type: MarketType::Spot,
+            strategy: "test".into(), reason: OrderReason::Strategy, order_id: None, dry_run: true, ts,
         }
     }
 
@@ -634,5 +678,60 @@ mod tests {
         r.record_funding_payment(10.0, 0);
         assert_eq!(r.daily_funding_quote(), 10.0);
         assert_eq!(r.daily_pnl_quote(), -10.0);
+    }
+
+    /// Regression test: a buy fill's fee must actually leave `capital_quote`
+    /// (and therefore `equity_quote`) the instant it's paid - not be
+    /// silently absorbed as if the fee never happened. Before this fix,
+    /// `evaluate_buy` reserved only the notional and `on_fill`'s Buy case
+    /// never touched `capital_quote` for the fee at all, so equity was
+    /// overstated by the sum of every entry fee ever paid.
+    #[test]
+    fn buy_fill_fee_reduces_capital_and_equity_immediately() {
+        let mut r = rm(100_000.0);
+        let pair = Pair::from("XBT/USD");
+        let m = meta(pair.clone(), MarketType::Spot);
+
+        let sig = signal(Side::Buy, pair.clone(), 1.0, 0);
+        let order = match r.evaluate_signal(&sig, &m, 100.0) {
+            RiskDecision::Approved(order) => order,
+            RiskDecision::Rejected(reason) => panic!("expected approval, got: {reason}"),
+        };
+        let capital_after_reservation = r.capital_quote();
+
+        let qty = order.size_quote / 100.0;
+        r.on_fill(&fill_with_fee(pair, Side::Buy, qty, 100.0, order.size_quote, 2.5, 0));
+
+        // The notional was already reserved at approval time; only the fee
+        // should move capital further, by exactly the fee amount.
+        assert_eq!(r.capital_quote(), capital_after_reservation - 2.5);
+        // equity_quote = capital_quote + mark-to-market position value; the
+        // position is marked at the same price it was entered at here, so
+        // equity should be down by precisely the fee versus starting capital.
+        assert!((r.equity_quote() - (100_000.0 - 2.5)).abs() < 1e-9);
+    }
+
+    /// An entry fee paid today must be visible to the circuit breaker via
+    /// `daily_pnl_quote` even before the position closes - a strategy that
+    /// churns entries can bleed capital purely to fees with no realized
+    /// loss and flat unrealized price PnL.
+    #[test]
+    fn entry_fee_is_reflected_in_daily_pnl_before_the_position_closes() {
+        let mut r = rm(100_000.0);
+        let pair = Pair::from("XBT/USD");
+        let m = meta(pair.clone(), MarketType::Spot);
+
+        let sig = signal(Side::Buy, pair.clone(), 1.0, 0);
+        let order = match r.evaluate_signal(&sig, &m, 100.0) {
+            RiskDecision::Approved(order) => order,
+            RiskDecision::Rejected(reason) => panic!("expected approval, got: {reason}"),
+        };
+        let qty = order.size_quote / 100.0;
+        r.on_fill(&fill_with_fee(pair.clone(), Side::Buy, qty, 100.0, order.size_quote, 3.0, 0));
+
+        // Flat price, no close yet - the only thing that should move
+        // daily_pnl_quote is the fee.
+        r.on_price_tick(&bot_core::PriceTick { pair, price: 100.0, funding_rate: None, ts: 1 });
+        assert!((r.daily_pnl_quote() - (-3.0)).abs() < 1e-9);
     }
 }

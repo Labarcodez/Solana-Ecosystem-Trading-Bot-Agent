@@ -34,16 +34,19 @@ being spent, not a service fee.
 ## Status: what actually works right now
 
 Every crate compiles, is unit-tested, and passes clippy with zero warnings —
-**124 tests, all passing** across the workspace. The full pipeline has been
-run end-to-end in `--mode dry_run --price-source mock`: real historical
-XBT/USD data replayed through the momentum strategy, a signal fired, the
-risk manager sized and approved an order, and the executor made a **live**
-call to Kraken's public `Ticker` endpoint to get a real fill price — no fake
-data, no mocked HTTP responses at the integration level. That run is also
-what caught and fixed a real bug this session (see
+**129 tests, all passing** across the workspace. The full pipeline has been
+run end-to-end, repeatedly, in `--mode dry_run --price-source mock`: real
+historical XBT/USD data replayed through the momentum strategy, signals
+fired, the risk manager sized and approved orders, and the executor made
+**live** calls to Kraken's public `Ticker` endpoint to get real fill
+prices — no fake data, no mocked HTTP responses at the integration level.
+Those runs are also what caught and fixed two real bugs this session (see
 [Honesty notes](#honesty-notes--known-limitations)): Kraken's classic REST
 API rejects the slash-separated pair spelling its own WebSocket v2 API
-requires, so the client now converts at its own boundary.
+requires, so the client now converts at its own boundary; and a
+`tokio::select!` race in the shutdown path that could silently drop a
+still-buffered signal or tick instead of finishing it, caught by the same
+mock run producing zero fills on some runs and a full run on others.
 
 Read [Honesty notes](#honesty-notes--known-limitations) before you point
 this at real funds — it explains precisely what's live-verified from this
@@ -268,7 +271,7 @@ watcher to solve here.
 ## Testing / verification
 
 ```bash
-cargo test --workspace                     # 124 tests, every crate
+cargo test --workspace                     # 129 tests, every crate
 cargo clippy --workspace --all-targets     # zero warnings
 cargo run --bin backtest -- --config config/config.toml --json
 cargo run --bin trading-bot -- run --price-source mock --no-tui
@@ -294,15 +297,27 @@ decision — not a bug report.
 - **Kraken public WebSocket v2** (`wss://ws.kraken.com/v2`) — confirmed
   live via a raw TLS handshake returning HTTP 101 this session; the ticker
   message parser is tested against Kraken's own documented example payload.
-- **A real bug was caught by actually running the pipeline, not just unit
-  tests**: Kraken's classic REST API rejects the slash-separated pair
-  spelling (`"XBT/USD"` → `EQuery:Unknown asset pair`) that its own
-  WebSocket v2 API requires (confirmed via direct `curl` against both).
-  `crates/execution::kraken_spot::rest_pair_symbol` converts at the REST
-  client's own boundary so the rest of the codebase can carry one spelling
-  end-to-end. Re-verified after the fix: a full dry-run momentum
-  buy-then-sell round trip now completes against the live `Ticker`
-  endpoint with no error.
+- **Two real bugs were caught by actually running the pipeline, not just
+  unit tests:**
+  - Kraken's classic REST API rejects the slash-separated pair spelling
+    (`"XBT/USD"` → `EQuery:Unknown asset pair`) that its own WebSocket v2
+    API requires (confirmed via direct `curl` against both).
+    `crates/execution::kraken_spot::rest_pair_symbol` converts at the REST
+    client's own boundary so the rest of the codebase can carry one
+    spelling end-to-end. Re-verified after the fix: a full dry-run
+    momentum buy-then-sell round trip now completes against the live
+    `Ticker` endpoint with no error.
+  - The live pipeline's shutdown path raced `tokio::select!`'s default
+    (randomized) branch selection against still-buffered ticks/signals: on
+    some runs the bot would exit having silently dropped a signal, or an
+    approved order, that was sitting in a channel waiting to be processed
+    — reproduced by running the same mock replay repeatedly and observing
+    it nondeterministically produce anywhere from zero to five completed
+    round trips. Fixed by making the shutdown-loop `select!`s `biased`
+    (drain-before-cancel, checked top-to-bottom instead of randomly) with
+    a guard flag to avoid busy-spinning once a channel closes. Re-verified
+    with five consecutive runs all producing the identical, full sequence
+    of fills.
 - **Request signing is independently cross-checked, not just
   self-consistent** — Kraken Spot's HMAC-SHA512 signing was checked against
   Kraken's own published worked example (secret/path/nonce/postdata from
@@ -312,6 +327,16 @@ decision — not a bug report.
   (same inputs → same signature, different inputs → different signature) —
   a weaker verification tier, called out explicitly rather than implied to
   be equally strong.
+- **Entry-fee accounting was a real gap, closed by review, not by running
+  the pipeline** — `RiskManager::on_fill`'s Buy case reserved a position's
+  notional at approval time but never debited the fee actually charged on
+  that fill, so `capital_quote`/`equity_quote` (and the backtester's
+  per-trade PnL stats, which share this code) silently overstated the
+  account by the sum of every entry fee ever paid; only exit fees were
+  netted out. Fixed in both `risk::RiskManager` and
+  `backtester::engine::apply_fill`, with regression tests asserting the
+  fee actually leaves capital/equity the instant it's paid and is visible
+  to the circuit breaker before a position even closes.
 
 ### What's real but not exercised against a funded account
 No funded Kraken API key was available in this sandbox. Everything above
@@ -378,7 +403,11 @@ improvement over the old Solana build's `solana_sdk::Keypair`, whose
 internal storage wasn't itself guaranteed zeroize-aware). The encrypted
 file on disk uses the same Argon2id (OWASP interactive baseline) +
 AES-256-GCM scheme as before; a wrong passphrase is rejected with a clear
-error rather than silently producing garbage credentials.
+error rather than silently producing garbage credentials. On Unix, the
+saved key file is chmod'd to `0600` (owner read/write only) immediately
+after writing — defense in depth, since the file only ever holds
+ciphertext, but there's no reason to leave it group/world-readable on a
+shared machine.
 
 ## Safety
 
